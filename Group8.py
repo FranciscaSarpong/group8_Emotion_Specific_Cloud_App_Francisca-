@@ -1713,7 +1713,7 @@ PAGES = {
 # Sidebar logo (optional; wrap in try so it doesn't crash if missing)
 try:
     st.sidebar.image(
-        "C:/Users/Francesca Manu/PycharmProjects/Text_Group_Project/Sidebar2.png",
+        "Sidebar2.png",
         use_column_width=False,
         width=300,
     )
