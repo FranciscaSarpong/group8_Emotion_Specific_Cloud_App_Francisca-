@@ -1,54 +1,78 @@
-import streamlit as st              # Web app framework
-import pandas as pd                 # Data handling
-import numpy as np                  # Numerics
-import matplotlib.pyplot as plt     # Plots (basic EDA)
+# ==== Imports & global setup ====
+import os, re, io, math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 import seaborn as sns
-import re
-import math
-import os
+from collections import Counter
+from PIL import Image
+
+import streamlit as st
 from gensim.models import Word2Vec
+import hashlib
+
+from sklearn.decomposition import TruncatedSVD
+
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import (
     precision_score, recall_score, f1_score, accuracy_score, roc_auc_score,
-    confusion_matrix,roc_curve
+    roc_curve, confusion_matrix
 )
 from sklearn.preprocessing import label_binarize
 from sklearn.ensemble import RandomForestClassifier
-from wordcloud import WordCloud
-import io
-from collections import Counter
 from sklearn.feature_extraction.text import TfidfVectorizer
+from wordcloud import WordCloud
 
+# Optional deps
+try:
+    from xgboost import XGBClassifier
+    XGB_OK = True
+except Exception:
+    XGB_OK = False
 
-# (Good practice after changing environments / versions)
+try:
+    from imblearn.over_sampling import SMOTE
+    SMOTE_OK = True
+except Exception:
+    SMOTE_OK = False
+
+# Streamlit safety
 try:
     st.cache_data.clear()
     st.cache_resource.clear()
 except Exception:
     pass
 
-
 st.set_page_config(page_title="Emotion Word Clouds (Word2Vec)", layout="wide")
 
 
-# One-line help per page
+
 PAGE_HELP = {
     "Home": "Overview of the project, goals, objectives, and navigation.",
-    "Data Load": "Upload CSV/Parquet, preview the data, inspect schema and distributions, and download the loaded dataset or a sample.",
-    "Preprocessing": "Clean text and map Score→Emotion. Output must be `st.session_state['df_clean']` with `clean_text` & `Emotion` columns.",
-    "Word2Vec Embeddings": "Train Word2Vec; create review-level embeddings; save X/y/label_map in session.",
-    "Modeling": "Train & compare Random Forest vs XGBoost; cross‑validation and imbalance handling.",
-    "Model Evaluation & Results": "Macro metrics, confusion matrices, ROC curves; identify best model.",
-    "Emotion Word Clouds": "Generate emotion‑specific word clouds from TF‑IDF/embedding weighting.",
-    "Predictions & Downloads": "Single/batch predictions + download models/metrics/cleaned CSV.",
-    "Conclusion & Insights": "Summarize findings and show the three word clouds."
+    "Data Load": "Load via path or upload CSV/Parquet, preview/EDA, cache to session.",
+    "Preprocess & Labels": "Clean text and map Score→Emotion. Produces df_clean with clean_text & Emotion.",
+    "Post-Cleaning Diagnostics": "Quality checks before embeddings.",
+    "Embeddings (Word2Vec)": "Train W2V on TRAIN only; build doc vectors (mean or SIF).",
+    "Modeling (RF & XGBoost)": "Stratified CV + Hold-out results. Class weights/SMOTE options.",
+    "Model Evaluation & Results": "Compare CV vs Test metrics, CMs, ROC, importance.",
+    "Word Clouds": "Emotion-specific word clouds (contrastive log-odds, centroid similarity).",
+    "Prediction Page": "Single/batch predictions using chosen model."
 }
 
+# ==== Helpers ====
 
-# Helpers (NO st.* calls except caching)
+def score_to_emotion(score: int) -> str:
+    """Amazon 1–5 stars → emotion label."""
+    try:
+        s = int(score)
+    except Exception:
+        return "Unknown"
+    if s <= 2: return "Negative"
+    if s == 3:  return "Neutral"
+    return "Positive"
 
 def safe_coerce_types(df: pd.DataFrame) -> pd.DataFrame:
-    """Coerce useful dtypes and parse epoch Time → datetime if present."""
+    """Coerce Score to Int64 and parse epoch Time → datetime if present."""
     if "Score" in df.columns:
         df["Score"] = pd.to_numeric(df["Score"], errors="coerce").astype("Int64")
     if "Time" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["Time"]):
@@ -56,12 +80,8 @@ def safe_coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 @st.cache_data(show_spinner=True)
-def load_reviews(file_obj, usecols=None, nrows=None) -> pd.DataFrame:
-    """
-    Uploader‑only loader. Reads CSV/Parquet from st.file_uploader file-like object.
-    - .parquet → pd.read_parquet (respects columns)
-    - otherwise → pd.read_csv (respects usecols & nrows)
-    """
+def load_reviews_uploaded(file_obj, usecols=None, nrows=None) -> pd.DataFrame:
+    """Read from Streamlit uploader (csv/parquet)."""
     if file_obj is None:
         return pd.DataFrame()
     name = file_obj.name.lower()
@@ -71,55 +91,56 @@ def load_reviews(file_obj, usecols=None, nrows=None) -> pd.DataFrame:
         df = pd.read_csv(file_obj, usecols=usecols if usecols else None, nrows=nrows)
     return safe_coerce_types(df).reset_index(drop=True)
 
-def score_to_emotion(score: int) -> str:
-    """1–2 → Negative, 3 → Neutral, 4–5 → Positive."""
-    try:
-        s = int(score)
-    except Exception:
-        return "Unknown"
-    if s <= 2: return "Negative"
-    if s == 3:  return "Neutral"
-    return "Positive"
+@st.cache_data(show_spinner=True)
+def load_reviews_from_path(path: str, usecols=None, nrows=None) -> pd.DataFrame:
+    """Read from a local absolute path (csv/parquet)."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Path not found: {path}")
+    p = path.lower()
+    if p.endswith(".parquet"):
+        df = pd.read_parquet(path, columns=usecols if usecols else None)
+    else:
+        df = pd.read_csv(path, usecols=usecols if usecols else None, nrows=nrows, encoding="utf-8")
+    return safe_coerce_types(df).reset_index(drop=True)
 
-# STEP 1: HOMEPAGE
+
+
+# PAGES
 
 def page_home():
-    st.title(" Emotion‑Specific Word Cloud from Amazon Reviews (Word2Vec)")
-    st.caption(PAGE_HELP["Home"])
+    st.title(" Emotion-Specific Word Cloud from Amazon Reviews (Word2Vec)")
+    st.caption(PAGE_HELP.get("Home", ""))
 
-    # Home page logo
-    st.image(
-        "C:/Users/Francesca Manu/PycharmProjects/Text_Group_Project/Group8_logo.png",
-        width=300,  # smaller width
-        caption="Emotion-Specific Word Cloud from Amazon Reviews"
+    # Create columns to position logo on the right
+    col1, col2 = st.columns([2, 1])
 
-    )
+    with col2:
+        # Home page logo (use a relative path or put image in /assets)
+        st.image(
+            "Group82.png",
+            width=300,
+            caption="Emotion-Specific Word Cloud from Amazon Reviews"
+        )
 
-    st.markdown("""
+    with col1:
+        st.markdown("""
         ### **Goal**
-        Build an automated system that analyzes Amazon Fine Food Reviews, detects **emotions** (Positive / Neutral / Negative),
-        and visualizes the vocabulary per emotion via **word clouds**, using **Word2Vec** + ML classifiers.
-
-        ### **Objectives**
-        1. Clean & normalize reviews; map stars → emotions.  
-        2. Train **Word2Vec**; create review embeddings.  
-        3. Train & compare **Random Forest** and **XGBoost** with macro metrics (Precision, Recall, F1, ROC‑AUC).  
-        4. Generate **emotion‑specific word clouds** for interpretability.  
-        5. Provide an interactive **Streamlit** app for exploration & predictions.
+        Build a pipeline that analyzes Amazon Fine Food Reviews, detects **emotions** (Positive / Neutral / Negative),
+        and visualizes vocabulary per emotion via **word clouds**, using **Word2Vec** + **Random Forest vs XGBoost**.
 
         ### **Navigation**
-        Use the sidebar to move step‑by‑step: Data Load → Preprocessing → Embeddings → Modeling → Evaluation → Word Clouds → Conclusion.
+        Use the sidebar to move step-by-step: Data Load → Preprocessing → Embeddings → Modeling → Evaluation → Word Clouds → Conclusion.
         """)
 
     # Team
     st.markdown("---")
     st.markdown("### Project Team")
     team = [
-        ("George Owell", "22256146", "Evaluation, Cross-validation"),
-        ("Francisca Manu Sarpong", "22255796", "Feature Engineering, Model Training"),
-        ("Franklina Oppong", "11410681", "Evaluation, Cross-validation"),
-        ("Ewuraben Biney", "22252464", "Prediction UI, Testing"),
-        ("Esther Edem Tulasi Carr", "22253335", "Documentation, Deployment"),
+        ("George Owell", "22256146", "http://emotionbasedwordcloud-kaqsykwxudaljgan3srpws.streamlit.app"),
+        ("Francisca Manu Sarpong", "22255796", ""),
+        ("Franklina Oppong", "11410681", ""),
+        ("Ewurabena Biney", "22252464", ""),
+        ("Esther Edem Tulasi Carr", "22253335", ""),
     ]
     c1, c2, c3 = st.columns([4, 2, 6])
     with c1:
@@ -129,166 +150,155 @@ def page_home():
         st.markdown("**Student ID**")
         for _, sid, _ in team: st.markdown(sid)
     with c3:
-        st.markdown("**Role**")
+        st.markdown("**App Link**")
         for _, _, role in team: st.markdown(role)
 
     st.info(" Start with **Data Load** in the sidebar.")
 
-
-# Page: Data Load (+ downloads)
-
 def page_data_load():
     st.title("Data Load")
     st.caption(PAGE_HELP["Data Load"])
+    st.markdown("Load from **local path** or **file uploader**. We’ll cache the DataFrame and show quick EDA.")
 
-    st.markdown(
-        "Please Upload `Reviewsample.csv` or `Reviews.parquet`. The app will parse dates, cache the data, and show quick EDA.")
+    # --- Inputs ---
+    default_cols = ["Score", "Summary", "Text"]
+    st.markdown("#### Columns to load")
+    selected_cols = st.multiselect("Choose columns (fewer → faster)", default_cols,
+                                   default=["Score", "Summary"])
 
-    #  File uploader
-    up = st.file_uploader("Upload file", type=["csv", "parquet"])
-
-    #  Column selection
-    default_cols = ["HelpfulnessNumerator", "HelpfulnessDenominator",
-                    "Score", "Time", "Summary", "Text"]
-    st.markdown("#### Columns to load (applies to CSV and Parquet)")
-    selected_cols = st.multiselect(
-        "Choose columns (fewer → faster)",
-        default_cols, default=["Score", "Time", "Summary", "Text"]
-    )
-
-    #  CSV-only partial read
     c1, c2, c3 = st.columns([1, 1, 1.2])
     with c1:
         first_n = st.checkbox("Read only first N (CSV)", value=True)
     with c2:
-        nrows = st.number_input("N rows", min_value=5_000, value=50_000, step=5_000)
+        nrows = st.number_input("N rows", min_value=5_000, value=20_000, step=5_000)
     with c3:
-        seed = st.number_input("Random seed", min_value=0, value=42, step=1)
+        _seed = st.number_input("Random seed (for any sampling)", min_value=0, value=42, step=1)
 
-    if st.button("Load Dataset"):
-        if up is None:
-            st.error("Please upload a CSV or Parquet file.")
-            return
+    # --- Path loader ---
+    st.markdown("#### Load from local path")
+    local_path = st.text_input("Absolute path (.csv or .parquet)",
+                               value="Reviewsample.csv")
+    btn_path = st.button("Load from path")
 
-        try:
-            df = load_reviews(
-                file_obj=up,
+    # --- Uploader loader ---
+    st.markdown("#### Or upload a file")
+    up = st.file_uploader("Upload file", type=["csv", "parquet"])
+    btn_up = st.button("Load from upload")
+
+    df = None
+    try:
+        if btn_path:
+            df = load_reviews_from_path(
+                local_path.strip(),
+                usecols=selected_cols if selected_cols else None,
+                nrows=int(nrows) if (first_n and local_path.lower().endswith(".csv")) else None
+            )
+        elif btn_up:
+            if up is None:
+                st.error("Please upload a CSV or Parquet file.")
+                return
+            df = load_reviews_uploaded(
+                up,
                 usecols=selected_cols if selected_cols else None,
                 nrows=int(nrows) if (first_n and up.name.lower().endswith(".csv")) else None
             )
-            if df.empty:
-                st.error("Loaded an empty DataFrame. Check the file and selected columns.")
-                return
+        else:
+            st.stop()  # wait for a button press
+    except Exception as e:
+        st.error(f"Unexpected error while loading data: {e}")
+        st.stop()
 
-            st.session_state["df"] = df
-            st.success(f"Loaded: {df.shape[0]:,} rows × {df.shape[1]} columns")
+    if df is None or df.empty:
+        st.error("Loaded an empty DataFrame. Check the path/file and selected columns.")
+        st.stop()
 
-            #  Preview & schema
-            st.subheader("Preview")
-            st.dataframe(df.head(10), use_container_width=True)
+    # Cache to session for later pages
+    st.session_state["df"] = df
+    st.success(f"Loaded: {df.shape[0]:,} rows × {df.shape[1]} columns")
 
-            st.subheader("Column Types & Missingness")
-            info = pd.DataFrame({
-                "Column": df.columns,
-                "Dtype": df.dtypes.astype(str),
-                "Non‑Null": df.notnull().sum(),
-                "Nulls": df.isnull().sum(),
-                "Null %": (df.isnull().sum() / len(df) * 100).round(2)
-            })
-            st.dataframe(info, use_container_width=True)
+    # --- Quick EDA ---
+    st.subheader("Preview")
+    st.dataframe(df.head(10), use_container_width=True)
 
-            st.subheader("Duplicates")
-            st.write(f"Exact duplicate rows: **{df.duplicated().sum():,}**")
+    st.subheader("Column Types & Missingness")
+    info = pd.DataFrame({
+        "Column": df.columns,
+        "Dtype": df.dtypes.astype(str),
+        "Non-Null": df.notnull().sum(),
+        "Nulls": df.isnull().sum(),
+        "Null %": (df.isnull().sum() / len(df) * 100).round(2)
+    })
+    st.dataframe(info, use_container_width=True)
 
-            #  Target awareness
-            if "Score" in df.columns:
-                st.subheader("Score & Emotion Distribution")
-                st.bar_chart(df["Score"].value_counts(dropna=False).sort_index())
-                emo = df["Score"].dropna().astype(int).map(score_to_emotion)
-                st.bar_chart(emo.value_counts())
+    st.subheader("Duplicates")
+    st.write(f"Exact duplicate rows: **{df.duplicated().sum():,}**")
 
-            if "Time" in df.columns and pd.api.types.is_datetime64_any_dtype(df["Time"]):
-                tmin, tmax = df["Time"].min(), df["Time"].max()
-                if pd.notnull(tmin) and pd.notnull(tmax):
-                    st.write(f"Time coverage: **{tmin.date()} → {tmax.date()}**")
+    if "Score" in df.columns:
+        st.subheader("Score & Emotion Distribution")
+        st.bar_chart(df["Score"].value_counts(dropna=False).sort_index())
+        emo = df["Score"].dropna().astype(int).map(score_to_emotion)
+        st.bar_chart(emo.value_counts())
 
-            st.info("Dataset cached. Next step: **Preprocessing** page.")
-        except Exception as e:
-            st.error(f"Unexpected error while loading data: {e}")
+    if "Time" in df.columns and pd.api.types.is_datetime64_any_dtype(df["Time"]):
+        tmin, tmax = df["Time"].min(), df["Time"].max()
+        if pd.notnull(tmin) and pd.notnull(tmax):
+            st.write(f"Time coverage: **{tmin.date()} → {tmax.date()}**")
+
+    st.info("Dataset cached. Next step: **Preprocess & Labels** page.")
 
 
 def page_preprocess():
+    st.title("Preprocess & Emotion Mapping")
+    st.caption("Clean **Summary**, map stars to emotions, and cache as df_clean.")
 
-    st.title(" Preprocess & Emotion Mapping")
-    st.markdown("""
-        ##### This page cleans and prepares the Amazon Fine Food Reviews dataset for analysis.
-        * It allows you to choose text-cleaning options (lowercasing, removing HTML, punctuation, digits, stopwords, etc.),limit rows for speed, and optionally remove duplicates.
-        
-        * The cleaned text is stored in a new column (clean_text),and each review is assigned an emotion label (Positive, Neutral, or Negative) based on its score.
-        
-        * It shows emotion distribution, previews the cleaned data, saves it in session state for later steps,and lets you download the processed dataset as a CSV..
-        """
-                )
-
-    # 0) Get raw dataset from Step 2
-    df = st.session_state.get("df", None)
+    df = st.session_state.get("df")
     if df is None:
         st.error("No dataset found. Please load data in *Data Load* first.")
         st.stop()
 
-    # 1) Cleaning options (global best-practice defaults)
-    st.markdown("### Cleaning Options")
+    # ---- Which text to use ----
+    st.markdown("#### Text Source")
+    use_summary_only = st.checkbox("Use Summary only (recommended for this project)", value=True)
+    fallback_to_text  = st.checkbox("Fallback to Text when Summary is missing/empty", value=True)
+
+    # ---- Cleaning options ----
     c1, c2, c3 = st.columns(3)
     with c1:
-        do_lower   = st.checkbox("Lowercase", value=True)
-        rm_html    = st.checkbox("Remove HTML-like tags", value=True)
-        rm_punct   = st.checkbox("Remove punctuation", value=True)
+        do_lower    = st.checkbox("Lowercase", True)
+        rm_html     = st.checkbox("Remove HTML-like tags", True)
+        rm_punct    = st.checkbox("Remove punctuation (after expanding negations)", True)
     with c2:
-        rm_digits  = st.checkbox("Remove digits", value=True)
-        collapse_ws= st.checkbox("Collapse extra spaces", value=True)
-        drop_empty = st.checkbox("Drop empty/NA cleaned rows", value=True)
+        rm_digits   = st.checkbox("Remove digits", True)
+        collapse_ws = st.checkbox("Collapse extra spaces", True)
+        drop_empty  = st.checkbox("Drop empty/NA cleaned rows", True)
     with c3:
-        use_nltk_stop = st.checkbox("Use NLTK stopwords", value=True)
-        do_lemmatize  = st.checkbox("Lemmatize (WordNet)", value=True)
-        do_stem       = st.checkbox("Stem (Porter)", value=False)
+        use_nltk_stop = st.checkbox("Use NLTK stopwords", True)
+        do_lemmatize  = st.checkbox("Lemmatize (WordNet)", True)
+        do_stem       = st.checkbox("Stem (Porter) — not recommended for Word2Vec", False)
 
-    st.caption("Tip: Prefer *lemmatization* for academic clarity. Avoid using stem & lemma together.")
+    # Guardrail: Word2Vec ≠ stemming
+    if do_stem:
+        st.info("Stemming may harm Word2Vec semantics; consider lemmatization only.")
 
-    # Limit rows to keep the app responsive on huge files
-    st.markdown("### Rows to Process")
+    # Row limits & hygiene
     col_a, col_b = st.columns(2)
     with col_a:
-        limit_rows = st.checkbox("Process only first N rows", value=True)
+        limit_rows = st.checkbox("Process only first N rows", True)
     with col_b:
-        n_limit = st.number_input("N rows (if limited)", min_value=5_000, value=50_000, step=5_000)
-
-    # Optional deduplication
-    st.markdown("### Data Hygiene")
+        n_limit = st.number_input("N rows (if limited)", min_value=5_000, value=20_000, step=5_000)
     rm_dups = st.checkbox("Remove exact duplicate rows before cleaning", value=False)
 
-    # 2) Lazy NLTK resource fetchers
+    # ---- NLTK assets (lazy) ----
     @st.cache_resource(show_spinner=False)
     def _ensure_nltk_assets():
+        import nltk
+        try: nltk.data.find("corpora/stopwords")
+        except: nltk.download("stopwords", quiet=True)
         try:
-            import nltk
-            nltk.data.find("corpora/stopwords")
-        except Exception:
-            try:
-                nltk.download("stopwords", quiet=True)
-            except Exception:
-                pass
-        try:
-            import nltk
-            nltk.data.find("corpora/wordnet")
-            nltk.data.find("corpora/omw-1.4")
-        except Exception:
-            try:
-                nltk.download("wordnet", quiet=True)
-                nltk.download("omw-1.4", quiet=True)
-            except Exception:
-                pass
+            nltk.data.find("corpora/wordnet"); nltk.data.find("corpora/omw-1.4")
+        except:
+            nltk.download("wordnet", quiet=True); nltk.download("omw-1.4", quiet=True)
 
-    # Local fallback stopwords (if NLTK not available)
     FALLBACK_STOPWORDS = set("""
     a an the and or but if while with without within into onto from to for of on in out by up down over under again further
     is are was were be been being do does did doing have has had having this that these those it its i me my we our you your
@@ -296,190 +306,236 @@ def page_preprocess():
     no nor not only own same so than too very can will just should now
     """.split())
 
+    # Keep negators even if they appear in stopwords
+    NEGATORS = {"not", "no", "never", "nor", "cannot", "can_not"}
+
     def get_stopwords():
         if use_nltk_stop:
-            _ensure_nltk_assets()
             try:
+                _ensure_nltk_assets()
                 from nltk.corpus import stopwords as sw
-                return set(sw.words("english"))
+                sw_set = set(sw.words("english"))
             except Exception:
-                st.warning("NLTK stopwords unavailable; falling back to built-in list.")
-        return FALLBACK_STOPWORDS
+                st.warning("NLTK stopwords unavailable; using fallback.")
+                sw_set = set(FALLBACK_STOPWORDS)
+        else:
+            sw_set = set(FALLBACK_STOPWORDS)
+        # ensure negators stay
+        sw_set = {w for w in sw_set if w not in NEGATORS}
+        return sw_set
 
-    #  3) Core text preprocessor
+    # --- small normalizer helpers ---
+    CONTRACTIONS = [
+        (r"won't", "will not"),
+        (r"can't", "can not"),
+        (r"ain't", "is not"),
+        (r"n['’]t\b", " not"),
+        (r"y['’]all", "you all"),
+        (r"gonna", "going to"),
+        (r"wanna", "want to"),
+    ]
+
+    def expand_contractions(s: str) -> str:
+        for pat, rep in CONTRACTIONS:
+            s = re.sub(pat, rep, s, flags=re.IGNORECASE)
+        return s
+
     def preprocess_text(text: str, stop_set: set) -> str:
         """
-        Normalize one review into a clean string:
-        - lowercase → remove HTML → remove punctuation → remove digits → collapse spaces
-        - tokenize on whitespace → remove stopwords & 1-char tokens
-        - optional lemmatization/stemming
+        Normalize summary text with negation-aware cleaning.
         """
         s = str(text)
 
         if do_lower:
             s = s.lower()
+
+        # Expand contractions FIRST so we preserve negations
+        s = expand_contractions(s)
+
         if rm_html:
             s = re.sub(r"<.*?>", " ", s)
+
+        # Remove punctuation AFTER expanding negations (apostrophes already handled)
         if rm_punct:
             s = re.sub(r"[^\w\s]", " ", s)
+
         if rm_digits:
             s = re.sub(r"\d+", " ", s)
+
         if collapse_ws:
             s = re.sub(r"\s+", " ", s).strip()
 
-        tokens = s.split()
-        if not tokens:
+        toks = s.split()
+        if not toks:
             return ""
 
-        tokens = [t for t in tokens if len(t) > 1 and t not in stop_set]
+        # Keep tokens not in stopwords OR are negators
+        toks = [t for t in toks if len(t) > 1 and (t not in stop_set or t in NEGATORS)]
 
         if do_lemmatize or do_stem:
-            _ensure_nltk_assets()
-            if do_lemmatize:
-                try:
+            try:
+                _ensure_nltk_assets()
+                if do_lemmatize:
                     from nltk.stem import WordNetLemmatizer
                     lem = WordNetLemmatizer()
-                    tokens = [lem.lemmatize(t) for t in tokens]
-                except Exception:
-                    st.warning("WordNet lemmatizer unavailable; skipping lemmatization.")
-            if do_stem:
-                try:
+                    toks = [lem.lemmatize(t) for t in toks]
+                if do_stem:
                     from nltk.stem import PorterStemmer
-                    stemmer = PorterStemmer()
-                    tokens = [stemmer.stem(t) for t in tokens]
-                except Exception:
-                    st.warning("Porter stemmer unavailable; skipping stemming.")
+                    ps = PorterStemmer()
+                    toks = [ps.stem(t) for t in toks]
+            except Exception:
+                st.warning("Lemmatizer/stemmer unavailable; skipping.")
 
-        return " ".join(tokens)
+        return " ".join(toks)
 
-    #  4) Run preprocessing
     if st.button("Run Preprocessing"):
-        work_df = df.copy()
-
-        # Optional: restrict rows for speed
+        work = df.copy()
         if limit_rows:
-            work_df = work_df.head(int(n_limit)).copy()
-
-        # Optional: remove exact duplicate rows (entire row)
+            work = work.head(int(n_limit)).copy()
         if rm_dups:
-            before = len(work_df)
-            work_df = work_df.drop_duplicates().reset_index(drop=True)
-            st.info(f"Removed {before - len(work_df)} duplicate rows.")
+            before = len(work)
+            work = work.drop_duplicates().reset_index(drop=True)
+            st.info(f"Removed {before - len(work)} duplicate rows.")
 
-        # Ensure required columns exist
-        for col in ["Text", "Score"]:
-            if col not in work_df.columns:
-                st.error(f"Required column '{col}' is missing from the dataset.")
-                st.stop()
+        # ---- Ensure required columns ----
+        need_cols = ["Score", "Summary"]
+        if not all(c in work.columns for c in need_cols):
+            st.error(f"Required columns missing. Found: {list(work.columns)}. Need: {need_cols}.")
+            st.stop()
 
-        # Ensure canonical dtypes
-        work_df["Text"] = work_df["Text"].astype(str)
-        work_df["Score"] = pd.to_numeric(work_df["Score"], errors="coerce").astype("Int64")
+        work["Score"]   = pd.to_numeric(work["Score"], errors="coerce").astype("Int64")
+        work["Summary"] = work["Summary"].astype(str)
 
-        # Build stopword set once
+        # Choose source text
+        if use_summary_only:
+            # summary only; optionally fall back to Text when summary is empty
+            if fallback_to_text and "Text" in work.columns:
+                text_fallback = work["Text"].astype(str)
+                src = np.where(work["Summary"].str.strip().eq(""), text_fallback, work["Summary"])
+                work["__source_text"] = pd.Series(src, index=work.index).astype(str)
+            else:
+                work["__source_text"] = work["Summary"]
+        else:
+            # combine Summary + Text (if you want to compare later)
+            if "Text" in work.columns:
+                work["__source_text"] = (work["Summary"].fillna("") + " " + work["Text"].astype(str).fillna("")).str.strip()
+            else:
+                work["__source_text"] = work["Summary"]
+
         stop_set = get_stopwords()
 
-        # Apply normalization (progress bar)
-        st.markdown("#### Cleaning Text…")
-        with st.spinner("Applying text normalization to reviews…"):
-            work_df["clean_text"] = work_df["Text"].apply(lambda x: preprocess_text(x, stop_set))
+        st.markdown("#### Cleaning Summaries…")
+        with st.spinner("Normalizing summaries (negation-aware)…"):
+            work["clean_text"] = work["__source_text"].apply(lambda x: preprocess_text(x, stop_set))
 
-        # Optionally drop empties
         if drop_empty:
-            before = len(work_df)
-            work_df = work_df[work_df["clean_text"].str.len() > 0].reset_index(drop=True)
-            removed = before - len(work_df)
+            before = len(work)
+            work = work[work["clean_text"].str.len() > 0].reset_index(drop=True)
+            removed = before - len(work)
             if removed > 0:
                 st.info(f"Dropped {removed} rows with empty cleaned text.")
 
-        #  5) Map Score → Emotion
-        # Reuse the helper from Step 2 if present; else define a local fallback
-        try:
-            mapper = score_to_emotion  # defined earlier in your file
-        except NameError:
-            def mapper(score):
-                try:
-                    s = int(score)
-                except Exception:
-                    return "Unknown"
-                if s in (1, 2): return "Negative"
-                if s == 3:       return "Neutral"
-                return "Positive"  # 4–5
+        # Map to Emotion (1–2 Neg, 3 Neu, 4–5 Pos)
+        work["Emotion"] = work["Score"].apply(score_to_emotion)
 
-        work_df["Emotion"] = work_df["Score"].apply(mapper)
-
-        #  6) Quick checks & outputs
+        # Show quick outputs
         st.subheader("Emotion Distribution")
-        emo_counts = work_df["Emotion"].value_counts()
+        emo_counts = work["Emotion"].value_counts()
         st.bar_chart(emo_counts)
-        st.write(emo_counts)
 
-        st.subheader("Preview of Cleaned Text")
-        cols_to_show = [c for c in ["Score", "Emotion", "Summary", "Text", "clean_text"] if c in work_df.columns]
-        st.dataframe(work_df[cols_to_show].head(12), use_container_width=True)
+        st.subheader("Preview (first 12)")
+        cols = [c for c in ["Score", "Emotion", "Summary", "clean_text"] if c in work.columns]
+        st.dataframe(work[cols].head(12), use_container_width=True)
 
-        # 7) Save to session for next steps
-        st.session_state["df_clean"] = work_df
-        st.session_state["cleaned_df"] = work_df  # alias for any page expecting this key
+        # Cache
+        st.session_state["df_clean"] = work.drop(columns=["__source_text"])
+        st.session_state["preprocess_text"] = preprocess_text
+        st.session_state["preproc_stopwords"] = stop_set
 
-        # Optional: allow download for reproducibility
+        # Download
         st.markdown("### Download Cleaned Subset")
-        csv_bytes = work_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            label="Download cleaned CSV",
-            data=csv_bytes,
+            "Download cleaned CSV",
+            data=work.drop(columns=["__source_text"]).to_csv(index=False).encode("utf-8"),
             file_name="amazon_reviews_cleaned.csv",
             mime="text/csv"
         )
-
-        st.success("Preprocessing complete ✅ — cleaned data saved to session as 'df_clean'.")
-
+        st.success("Preprocessing complete — df_clean ready (cleaned on **Summary**).")
 
 
 # STEP 4: POST‑CLEANING DIAGNOSTICS
 def page_diagnostics():
     """
-    Post‑Cleaning Diagnostics
+    Post-Cleaning Diagnostics
     -------------------------
-    Purpose: verify that cleaning & label mapping produced a healthy corpus.
-
+    Validates data quality before embeddings & modeling:
+      • Corpus shape, token length distribution (+ quantiles)
+      • Vocabulary size & lexical richness (TTR, Herdan's C, hapax)
+      • Top tokens (overall + per-emotion)
+      • Emotion distribution
+      • Short-review & duplicate guardrails (exact + stable MD5 hash)
+      • Optional TF-IDF signal check (diagnostic only)
+    Writes back to st.session_state['df_clean'] ONLY when you confirm.
     """
 
-    st.title(" Post‑Cleaning Diagnostics")
+    st.title(" Post-Cleaning Diagnostics")
     st.markdown("""
     This page **validates data quality** before embeddings & modeling:
     - Corpus shape, token length distribution  
     - Vocabulary size & lexical richness  
-    - Overall top tokens (frequency)  
+    - Top tokens (overall & per emotion)  
     - Emotion distribution  
-    - Short‑review & duplicate guardrails  
-    - *(Optional)* overall TF‑IDF signal check
+    - Short-review & duplicate guardrails  
+    - *(Optional)* overall TF-IDF signal check
     """)
 
-    #  0) Load cleaned data
+    # 0) Load cleaned data
     df = st.session_state.get("df_clean")
     if df is None or "clean_text" not in df.columns or "Emotion" not in df.columns:
         st.error("No cleaned dataset found. Please run **Preprocess & Emotion Mapping** first.")
         st.stop()
     df = df.copy()
 
-    #  1) Corpus shape & token lengths
+    # Optional sampling for very large datasets (keeps page responsive)
+    with st.expander("Performance options"):
+        do_sample = st.checkbox("Diagnose on a random sample", value=False)
+        # adapt bounds to dataset size to avoid forcing 5k on small sets
+        max_n = int(min(200_000, len(df)))
+        default_n = int(min(20_000, max_n)) if max_n >= 20_000 else max_n
+        sample_n = st.number_input("Sample size", 1_000, max_n, default_n, 1_000)
+        sample_seed = st.number_input("Sample seed", 0, 9999, 42, 1)
+
+    if do_sample and len(df) > sample_n:
+        df = df.sample(n=int(sample_n), random_state=int(sample_seed)).reset_index(drop=True)
+        try:
+            total_rows = st.session_state["df_clean"].shape[0]
+        except Exception:
+            total_rows = "?"
+        st.info(f"Diagnosing on a random sample of **{len(df):,}** rows (out of {total_rows:,}).")
+
+    # 1) Corpus shape & token lengths
     st.subheader("Corpus Shape & Hygiene")
     rows = len(df)
     nn_clean = df["clean_text"].notna().sum()
     nn_emot  = df["Emotion"].notna().sum()
     st.write(
-        f"Rows: **{rows:,}** | non‑null `clean_text`: **{nn_clean:,}** | "
-        f"non‑null `Emotion`: **{nn_emot:,}**"
+        f"Rows: **{rows:,}** | non-null `clean_text`: **{nn_clean:,}** | "
+        f"non-null `Emotion`: **{nn_emot:,}**"
     )
 
-    lengths = df["clean_text"].fillna("").str.split().apply(len)
-    df["_len_tokens"] = lengths  # temp col for guardrails
-
+    # token lengths (fast split count)
+    lengths = df["clean_text"].fillna("").str.split().str.len()
     m1, m2, m3 = st.columns(3)
     m1.metric("Median tokens/review", int(np.median(lengths)))
     m2.metric("Mean tokens/review", f"{np.mean(lengths):.2f}")
     m3.metric("Max tokens/review", int(np.max(lengths)))
+
+    # helpful quantiles to understand tails
+    try:
+        q10, q50, q90, q99 = np.quantile(lengths, [0.1, 0.5, 0.9, 0.99])
+        st.caption(f"Length quantiles — 10%: {q10:.0f}, 50%: {q50:.0f}, 90%: {q90:.0f}, 99%: {q99:.0f}")
+    except Exception:
+        pass
 
     fig, ax = plt.subplots(figsize=(9, 4))
     sns.histplot(lengths, bins=80, kde=False, ax=ax)
@@ -489,8 +545,18 @@ def page_diagnostics():
 
     # 2) Lexical richness
     st.subheader("Vocabulary & Lexical Richness")
-    tokens_series = df["clean_text"].fillna("").str.split()
-    vocab_counter = Counter(t for row in tokens_series for t in row)
+
+    @st.cache_data(show_spinner=False)
+    def _token_series(clean_col: pd.Series) -> pd.Series:
+        return clean_col.fillna("").str.split()
+
+    tokens_series = _token_series(df["clean_text"])
+
+    @st.cache_data(show_spinner=False)
+    def _vocab_counter(tokens: pd.Series) -> Counter:
+        return Counter(t for row in tokens for t in row)
+
+    vocab_counter = _vocab_counter(tokens_series)
     vocab_size = len(vocab_counter)
     total_tokens = int(lengths.sum())
     ttr = (vocab_size / total_tokens) if total_tokens > 0 else 0.0
@@ -502,15 +568,15 @@ def page_diagnostics():
     c2.metric("Total tokens", f"{total_tokens:,}")
     c3.metric("Type–Token Ratio (TTR)", f"{ttr:.4f}")
     c4.metric("Herdan’s C", f"{herdan_c:.4f}")
-    st.caption(f"Hapax proportion (tokens with frequency = 1): **{hapax_prop:.3f}**")
+    st.caption(f"Hapax proportion (frequency = 1): **{hapax_prop:.3f}**")
 
-    #  3) Emotion distribution
+    # 3) Emotion distribution
     st.subheader("Emotion Distribution")
     emo_counts = df["Emotion"].value_counts()
     st.bar_chart(emo_counts)
     st.dataframe(emo_counts.rename("Count").to_frame(), use_container_width=True)
 
-    #  4) Top tokens overall (frequency)
+    # 4) Top tokens overall (frequency) + per emotion
     st.subheader("Top Tokens — Overall (frequency)")
     top_overall_k = st.slider("Show top N tokens", 10, 50, 20, 5, key="diag_top_overall_k")
     top_overall = pd.DataFrame(vocab_counter.most_common(top_overall_k),
@@ -521,163 +587,184 @@ def page_diagnostics():
     ax2.set_title(f"Top {top_overall_k} Tokens (Overall)")
     st.pyplot(fig2)
 
-    #  5) Optional: overall TF‑IDF signal check
-    with st.expander("Optional: Overall TF‑IDF Signal Check"):
-        max_feats = st.slider("Max features", 1000, 12000, 4000, 500,
+    # Per-emotion token view (helps spot leakage/bias)
+    st.subheader("Top Tokens — Per Emotion")
+    per_k = st.slider("Top N per emotion", 5, 40, 15, 5, key="diag_top_per_emo")
+    cols = st.columns(min(3, df["Emotion"].nunique()))
+    for i, emo in enumerate(sorted(df["Emotion"].dropna().unique())):
+        with cols[i % len(cols)]:
+            c = Counter(t for row in tokens_series[df["Emotion"] == emo] for t in row)
+            top_e = pd.DataFrame(c.most_common(per_k), columns=["Token", "Frequency"])
+            st.markdown(f"**{emo}**")
+            st.dataframe(top_e, use_container_width=True)
+
+    # 5) Optional: overall TF-IDF signal check (diagnostic only)
+    with st.expander("Optional: Overall TF-IDF Signal Check"):
+        max_feats = st.slider("Max features", 1_000, 12_000, 4_000, 500,
                               help="Limit vocabulary to keep this fast.")
-        tfidf = TfidfVectorizer(max_features=max_feats, token_pattern=r"(?u)\b\w+\b")
-        X = tfidf.fit_transform(df["clean_text"].fillna(""))
-        vocab = np.array(tfidf.get_feature_names_out())
+        token_pattern = r"(?u)\b\w+\b"  # keep all word chars; your clean_text already removed most noise
+
+        @st.cache_data(show_spinner=False)
+        def _tfidf_overall(clean_text: pd.Series, max_features: int):
+            vec = TfidfVectorizer(max_features=max_features, token_pattern=token_pattern)
+            X = vec.fit_transform(clean_text.fillna(""))
+            vocab = np.array(vec.get_feature_names_out())
+            mean_scores = np.asarray(X.mean(axis=0)).ravel()
+            return vocab, mean_scores
+
+        vocab, mean_scores = _tfidf_overall(df["clean_text"], int(max_feats))
         k = st.slider("Top N tokens to display", 10, 40, 20, 5, key="diag_tfidf_topk")
-        mean_scores = np.asarray(X.mean(axis=0)).ravel()
         order = np.argsort(mean_scores)[::-1][:k]
-        tfidf_overall = pd.DataFrame({"Token": vocab[order], "Mean TF‑IDF": mean_scores[order]})
+        tfidf_overall = pd.DataFrame({"Token": vocab[order], "Mean TF-IDF": mean_scores[order]})
         st.dataframe(tfidf_overall, use_container_width=True)
 
-    #  6) Guardrail: short reviews
+    # 6) Guardrail: short reviews
     st.subheader("Short Reviews (≤ threshold tokens)")
     thr = st.slider("Threshold (tokens)", 1, 10, 2, 1, key="diag_short_thr")
-    n_short = int((df["_len_tokens"] <= thr).sum())
+    short_mask = lengths <= thr
+    n_short = int(short_mask.sum())
     st.write(f"Found **{n_short:,}** reviews with ≤ {thr} tokens.")
     with st.expander("Preview some short reviews"):
         st.dataframe(
-            df.loc[df["_len_tokens"] <= thr, ["Score", "Emotion", "clean_text"]].head(20),
+            df.loc[short_mask, ["Score", "Emotion", "clean_text"]].head(20),
             use_container_width=True
         )
 
-    if st.checkbox("Remove these short reviews and update session", value=False, key="diag_drop_short"):
-        keep = df["_len_tokens"] > thr
-        removed = int((~keep).sum())
-        df2 = df.loc[keep].drop(columns=["_len_tokens"]).reset_index(drop=True)
+    apply_short = st.checkbox("Remove these short reviews and update session",
+                              value=False, key="diag_drop_short")
+    # We do NOT mutate df in place; only write back if confirmed:
+    if apply_short and n_short > 0:
+        df2 = df.loc[~short_mask].reset_index(drop=True)
         st.session_state["df_clean"] = df2
-        st.success(f"Removed {removed:,} rows. Session updated. Re‑run diagnostics if you wish.")
-    else:
-        df.drop(columns=["_len_tokens"], inplace=True, errors="ignore")
+        st.success(f"Removed {n_short:,} rows. Session updated. Re-run diagnostics if you wish.")
 
-    #  7) Optional: near‑duplicate detection
-    with st.expander("Optional: Near‑duplicates by content hash"):
-        hashes = df["clean_text"].fillna("").map(hash)
-        dup_mask = hashes.duplicated(keep="first")
-        n_dup = int(dup_mask.sum())
-        st.write(f"Potential exact duplicates (same cleaned text): **{n_dup:,}**")
-        if n_dup > 0:
-            st.dataframe(df.loc[dup_mask, ["Emotion", "clean_text"]].head(20),
-                         use_container_width=True)
-            if st.checkbox("Drop exact duplicates by cleaned text", value=False, key="diag_drop_dups"):
-                df2 = df.loc[~dup_mask].reset_index(drop=True)
-                st.session_state["df_clean"] = df2
-                st.success(f"Dropped {n_dup:,} duplicate rows. Session updated.")
+    # 7) Optional: duplicate detection (exact + stable hash)
+    with st.expander("Optional: Duplicates / near-duplicates"):
+        st.caption("Uses exact `clean_text` and a **stable MD5** content hash (Python's builtin hash is not stable).")
 
-# STEP 5: EMBEDDINGS (Word2Vec)
+        # A) exact duplicates by cleaned text
+        dup_mask_exact = df["clean_text"].duplicated(keep="first")
+        n_dup_exact = int(dup_mask_exact.sum())
+        st.write(f"Exact duplicates by `clean_text`: **{n_dup_exact:,}**")
+
+        # B) stable content hash (md5 of cleaned text)
+        @st.cache_data(show_spinner=False)
+        def _content_hashes(series: pd.Series) -> pd.Series:
+            return series.fillna("").map(lambda s: hashlib.md5(s.encode("utf-8")).hexdigest())
+
+        hashes = _content_hashes(df["clean_text"])
+        dup_mask_hash = hashes.duplicated(keep="first")
+        n_dup_hash = int(dup_mask_hash.sum())
+        st.write(f"Stable-hash duplicates: **{n_dup_hash:,}**")
+
+        if n_dup_exact > 0:
+            st.dataframe(df.loc[dup_mask_exact, ["Emotion", "clean_text"]].head(20), use_container_width=True)
+
+        # Drop options (separate; pick one)
+        drop_exact = st.checkbox("Drop exact `clean_text` duplicates and update session",
+                                 value=False, key="diag_drop_dups_exact")
+        if drop_exact and n_dup_exact > 0:
+            df2 = df.loc[~dup_mask_exact].reset_index(drop=True)
+            st.session_state["df_clean"] = df2
+            st.success(f"Dropped {n_dup_exact:,} exact duplicates. Session updated.")
+
+        drop_hash = st.checkbox("Drop stable-hash duplicates and update session",
+                                value=False, key="diag_drop_dups_hash")
+        if drop_hash and n_dup_hash > 0:
+            df2 = df.loc[~dup_mask_hash].reset_index(drop=True)
+            st.session_state["df_clean"] = df2
+            st.success(f"Dropped {n_dup_hash:,} hash-identified duplicates. Session updated.")
+
+    st.info("Diagnostics complete. If you applied any guardrails, re-run this page to see updated stats.")
+
 
 def page_word2vec():
-
     """
-    Train a Word2Vec model on the cleaned corpus and compute per‑review embeddings.
-    Outputs saved to session_state:
-      - w2v_model  : trained gensim model
-      - X_emb      : ndarray [n_docs, vector_size] (mean of token vectors per review)
-      - y_labels   : ndarray [n_docs] (encoded labels from Emotion)
-      - label_map  : dict {Emotion -> int}
+    Embeddings (Word2Vec)
+    ---------------------
+    - Trains Word2Vec on TRAIN split only (prevents leakage).
+    - Builds review vectors by mean or SIF (train-only token frequencies).
+    - Optional: remove 1st principal component (full SIF) and/or L2-normalize.
+    - Reports vocab size, zero-vector rate, and in-vocab token coverage (overall & per emotion).
+    Saves in session:
+      w2v_model, X_emb, y_labels, label_map, train_index, test_index, embedding_used
     """
 
-    st.title(" Word2Vec — Train & Vectorize")
-    st.markdown("""
-    ## Word2Vec — Turning Reviews into Numbers
-    **Purpose:**  
-    This page trains a **Word2Vec embedding model** on the cleaned text corpus and converts each review into a **dense vector representation** for machine learning.
-    """)
+    st.title("Embeddings (Word2Vec)")
+    st.caption("Train on TRAIN only; build review vectors; cache for modeling. Optional full SIF + L2 norm.")
 
-    #  0) Fetch cleaned data
-    df_clean = st.session_state.get("df_clean", None)
+    # ---------- Guards ----------
+    df_clean = st.session_state.get("df_clean")
     if df_clean is None or "clean_text" not in df_clean.columns or "Emotion" not in df_clean.columns:
-        st.error("No cleaned dataset found. Please run **Preprocess & Emotion Mapping** first.")
+        st.error("Run **Preprocess & Emotion Mapping** first.")
         st.stop()
 
-    # Keep only the columns we need; create tokens column
-    work_df = df_clean[["clean_text", "Emotion", "Score"]].copy()
-    work_df["tokens"] = work_df["clean_text"].astype(str).apply(str.split)
+    # Tokens
+    work = df_clean[["clean_text", "Emotion", "Score"]].copy()
+    work["tokens"] = work["clean_text"].astype(str).apply(str.split)
 
-    # Quick QA note on short docs
-    n_short = int((work_df["tokens"].str.len() <= 2).sum())
-    if n_short:
-        st.info(f"{n_short} very short reviews (≤ 2 tokens) remain; "
-                "they may yield zero vectors if none of their tokens are in the Word2Vec vocabulary.")
-
-    # 1) Hyper‑parameters UI
-    st.markdown("### Hyper‑parameters")
+    # ---------- Hyper-parameters & options ----------
     c1, c2, c3 = st.columns(3)
     with c1:
-        vector_size = st.number_input("vector_size (embedding dim)", 50, 600, 200, 25)
-        window = st.number_input("window (context size)", 2, 15, 5, 1)
-        min_count = st.number_input("min_count (discard rare words <)", 1, 20, 5, 1)
+        vector_size = int(st.number_input("vector_size", 50, 600, 200, 25))
+        window      = int(st.number_input("window", 2, 15, 5, 1))
+        min_count   = int(st.number_input("min_count", 1, 20, 5, 1))
     with c2:
-        sg_choice = st.selectbox("Architecture", ["Skip‑gram (sg=1)", "CBOW (sg=0)"], index=0)
-        epochs = st.number_input("epochs", 3, 50, 10, 1)
-        negative = st.number_input("negative sampling (0=off)", 0, 20, 10, 1)
+        sg_choice   = st.selectbox("Architecture", ["Skip-gram (sg=1)", "CBOW (sg=0)"], index=0)
+        epochs      = int(st.number_input("epochs", 3, 50, 10, 1))
+        negative    = int(st.number_input("negative sampling (0=off)", 0, 20, 10, 1))
     with c3:
-        train_on_split = st.checkbox("Train on TRAIN split only (avoid leakage)", value=True)
-        test_size = st.slider("Test size (if split)", 0.1, 0.4, 0.2, 0.05)
-        seed = st.number_input("random_state / seed", 0, 9999, 42, 1)
+        test_size   = float(st.slider("Test size (hold-out)", 0.1, 0.4, 0.2, 0.05))
+        seed        = int(st.number_input("random_state / seed", 0, 9999, 42, 1))
+        use_sif     = st.checkbox("Use SIF token weighting", value=False,
+                                  help="Smooth Inverse Frequency weighting on tokens (TRAIN-only stats).")
+
+    # Advanced options
+    with st.expander("Advanced (recommended defaults)"):
+        sample = float(st.number_input("Downsampling of very frequent words (sample)", 0.0, 0.01, 1e-3, 1e-4,
+                                       help="Higher → more aggressive subsampling of very frequent words. 1e-3 is a strong default."))
+        remove_pc = st.checkbox("Remove 1st principal component (full SIF)", value=use_sif,
+                                help="Standard SIF: subtract projection on top PC fitted on TRAIN embeddings.")
+        do_l2     = st.checkbox("L2-normalize review vectors", value=True)
 
     sg = 1 if "sg=1" in sg_choice else 0
-    st.caption(
-        "Guidance: With vocab ≈ 30–40k tokens, **min_count=5** and **vector_size=200** are strong defaults. "
-        "Skip‑gram (sg=1) often performs better on rarer words."
+    st.caption("Tip: With vocab ≈30–40k, min_count=5, vector_size=200, sg=1, sample≈1e-3 are strong defaults.")
+
+    # ---------- Stratified split ----------
+    trn, tst = train_test_split(
+        work, test_size=test_size, random_state=seed, stratify=work["Emotion"]
     )
+    st.caption(f"Training Word2Vec on TRAIN only: **{len(trn):,}** documents.")
 
-    # 2) Build training corpus
-    if train_on_split:
-        # Stratified split to avoid leakage; train Word2Vec only on train tokens
-        trn, _ = train_test_split(
-            work_df, test_size=float(test_size), random_state=int(seed), stratify=work_df["Emotion"]
-        )
-        corpus_tokens = trn["tokens"].tolist()
-        st.info(f"Training on TRAIN only: **{len(trn):,}** documents.")
-    else:
-        corpus_tokens = work_df["tokens"].tolist()
-        st.info(f"Training on ALL cleaned reviews: **{len(work_df):,}** documents.")
-
-    #  3) Train Word2Vec (no double‑training)
+    # ---------- Train Word2Vec (cached) ----------
     @st.cache_resource(show_spinner=True)
-    def train_w2v(corpus, vec, win, minc, sg, epochs, negative, seed):
-        """
-        Build vocab once, then train once.
-        Cached by hyper‑params & corpus tokens to avoid re‑training unnecessarily.
-        """
+    def train_w2v(corpus_tokens, vec, win, minc, sg, epochs, negative, sample, seed):
         model = Word2Vec(
-            vector_size=int(vec),
-            window=int(win),
-            min_count=int(minc),
-            sg=int(sg),  # 0=CBOW, 1=Skip‑gram
-            negative=int(negative),
-            workers=min(4, os.cpu_count() or 1),  # safe for local/Cloud
-            seed=int(seed),
+            vector_size=vec,
+            window=win,
+            min_count=minc,
+            sg=sg,
+            negative=negative,
+            sample=sample,
+            workers=min(4, os.cpu_count() or 1),
+            seed=seed
         )
-        model.build_vocab(corpus)
-        model.train(corpus, total_examples=len(corpus), epochs=int(epochs))
+        model.build_vocab(corpus_tokens)
+        model.train(corpus_tokens, total_examples=len(corpus_tokens), epochs=epochs)
         return model
 
     with st.spinner("Training Word2Vec…"):
-        w2v_model = train_w2v(
-            corpus=corpus_tokens,
-            vec=vector_size,
-            win=window,
-            minc=min_count,
-            sg=sg,
-            epochs=epochs,
-            negative=negative,
-            seed=seed
+        w2v = train_w2v(
+            trn["tokens"].tolist(), vector_size, window, min_count, sg, epochs, negative, sample, seed
         )
 
-    vocab_size = len(w2v_model.wv.key_to_index)
-    st.success(f"✅ Trained Word2Vec. Vocabulary size after min_count: **{vocab_size:,}**")
+    vocab_size = len(w2v.wv.key_to_index)
+    st.success(f"✅ Trained Word2Vec. Vocabulary size (after min_count={min_count}): **{vocab_size:,}**")
 
-    # 4) Nearest‑neighbor sanity check
+    # ---------- Nearest-neighbor sanity check ----------
     st.markdown("#### Nearest words (sanity check)")
-    default_terms = [w for w in ["good", "bad", "love", "terrible", "taste", "coffee"] if w in w2v_model.wv]
-    # Limit options list length for UI responsiveness
-    options_list = list(w2v_model.wv.key_to_index.keys())
+    default_terms = [w for w in ["good", "bad", "love", "terrible", "taste"] if w in w2v.wv]
+    options_list = list(w2v.wv.key_to_index.keys())
     probe_terms = st.multiselect(
         "Pick words to inspect",
         options=options_list[: min(8000, len(options_list))],
@@ -685,224 +772,236 @@ def page_word2vec():
     )
     for term in probe_terms:
         try:
-            sims = w2v_model.wv.most_similar(term, topn=8)
+            sims = w2v.wv.most_similar(term, topn=8)
             st.write("**" + term + "** → " + ", ".join([f"{w} ({s:.2f})" for w, s in sims]))
         except KeyError:
-            # Shouldn’t happen since we gate by in-vocab terms, but safe-guard anyway
             pass
 
-    #  5) Build per‑review embeddings
-    st.markdown("### Build per‑review embeddings")
+    # Optional tiny intrinsic check
+    def _cos(a, b):
+        if a not in w2v.wv or b not in w2v.wv: return None
+        va, vb = w2v.wv[a], w2v.wv[b]
+        return float(np.dot(va, vb) / (np.linalg.norm(va) * np.linalg.norm(vb) + 1e-12))
+    if {"good", "great", "terrible"} <= set(w2v.wv.key_to_index):
+        c1 = _cos("good", "great"); c2 = _cos("good", "terrible")
+        if c1 is not None and c2 is not None:
+            st.caption(f"Intrinsic sanity: cos(good, great)={c1:.3f} vs cos(good, terrible)={c2:.3f}")
 
-    dim = int(vector_size)
+    # ---------- Build review vectors (mean or SIF) ----------
+    dim = vector_size
 
-    def doc_vector(tokens, model, dim):
-        """
-        Average the word vectors for tokens that exist in the model vocab.
-        Returns a zero vector if no token is in-vocab (all OOV).
-        """
-        vecs = [model.wv[t] for t in tokens if t in model.wv]
-        if not vecs:
-            return np.zeros(dim, dtype="float32")
-        return np.mean(vecs, axis=0).astype("float32")
+    # Train-only token frequency for SIF
+    train_token_freq = Counter(t for row in trn["tokens"] for t in row)
+    total_train_tokens = max(sum(train_token_freq.values()), 1)
+    a = 1e-3  # SIF smoothing (fixed strong default)
 
-    # Compute document vectors for all reviews (including test if trained on split)
-    X_emb = np.vstack([doc_vector(toks, w2v_model, dim) for toks in work_df["tokens"]])
+    def sif_weight(tok: str) -> float:
+        return a / (a + train_token_freq.get(tok, 0) / total_train_tokens)
 
-    # QA: how many rows are all-zero (all OOV tokens)?
+    def doc_vector(tokens, model, dim, use_sif=False):
+        vecs = []
+        for t in tokens:
+            if t in model.wv:
+                w = sif_weight(t) if use_sif else 1.0
+                vecs.append(w * model.wv[t])
+        return np.mean(vecs, axis=0).astype("float32") if vecs else np.zeros(dim, dtype="float32")
+
+    # All-doc embeddings (built with the model trained on TRAIN)
+    X_emb = np.vstack([doc_vector(toks, w2v, dim, use_sif=use_sif) for toks in work["tokens"]])
+
+    # Optional: full SIF (remove 1st principal component) — fit PC on TRAIN ONLY
+    if use_sif and remove_pc and len(trn) > 2:
+        trn_mask = work.index.isin(trn.index)
+        svd = TruncatedSVD(n_components=1, random_state=seed)
+        try:
+            svd.fit(X_emb[trn_mask, :])
+            u = svd.components_[0]  # shape (dim,)
+            # subtract projection on u
+            X_emb = X_emb - (X_emb @ u[:, None]) * u[None, :]
+            st.caption("Applied full SIF: removed 1st principal component fitted on TRAIN.")
+        except Exception:
+            st.warning("Could not apply PC removal (SVD issue). Proceeding without it.")
+
+    # Optional: L2-normalize
+    if do_l2:
+        X_emb = X_emb / (np.linalg.norm(X_emb, axis=1, keepdims=True) + 1e-12)
+        st.caption("Applied L2 normalization to review vectors.")
+
+    # QA stats
     zero_rows = int((X_emb == 0).all(axis=1).sum())
-    st.caption(f"Zero‑vector reviews (all tokens OOV): **{zero_rows}** "
-               f"({zero_rows / len(work_df):.2%}). Consider lowering `min_count` if this is high.")
+    st.caption(f"Zero-vector reviews (all tokens OOV): **{zero_rows}** "
+               f"({zero_rows / len(work):.2%}). Consider lowering `min_count` if high.")
 
-    # Encode labels into integers for modeling
-    label_map = {lbl: idx for idx, lbl in enumerate(sorted(work_df["Emotion"].unique()))}
-    y_labels = work_df["Emotion"].map(label_map).values
+    # Token coverage (in-vocab) overall & per emotion
+    def token_coverage(rows_tokens) -> tuple[int, int]:
+        total, invocab = 0, 0
+        for toks in rows_tokens:
+            total += len(toks)
+            invocab += sum(1 for t in toks if t in w2v.wv)
+        return invocab, total
 
-    st.write(f"Embeddings shape: **{X_emb.shape}**  (rows: reviews, cols: {dim})")
-    st.write(f"Label map: {label_map}")
+    inv, tot = token_coverage(work["tokens"])
+    st.write(f"**Token coverage overall**: {inv:,}/{tot:,} = {(inv/max(tot,1)):.2%}")
 
-    # 6) Persist to session for Modeling & Clouds
-    st.session_state["w2v_model"] = w2v_model
+    cov_cols = st.columns(min(3, work["Emotion"].nunique()))
+    for i, emo in enumerate(sorted(work["Emotion"].unique())):
+        with cov_cols[i % len(cov_cols)]:
+            inv_e, tot_e = token_coverage(work.loc[work["Emotion"] == emo, "tokens"])
+            st.metric(f"{emo} coverage", f"{(inv_e/max(tot_e,1)):.2%}", help=f"{inv_e:,}/{tot_e:,} tokens in-vocab")
+
+    # Show most down-weighted (frequent) tokens under SIF for transparency
+    if use_sif:
+        with st.expander("Most frequent tokens in TRAIN (lowest SIF weights)"):
+            top_n = int(st.slider("Show top N frequent tokens", 10, 100, 30, 5))
+            items = sorted(train_token_freq.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+            rows = [{"Token": t, "Freq(TRAIN)": c, "SIF weight": sif_weight(t)} for t, c in items]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    # Encode labels
+    label_map = {lbl: idx for idx, lbl in enumerate(sorted(work["Emotion"].unique()))}
+    y_labels = work["Emotion"].map(label_map).values
+
+    st.write(f"Embeddings shape: **{X_emb.shape}**   |   Labels map: {label_map}")
+
+    # ---------- Persist to session ----------
+    st.session_state["w2v_model"] = w2v
     st.session_state["X_emb"] = X_emb
     st.session_state["y_labels"] = y_labels
     st.session_state["label_map"] = label_map
-    st.success("Per‑review embeddings are ready ✅. Go to **Modeling** to train RF & XGBoost.")
+    st.session_state["train_index"] = trn.index.to_numpy()
+    st.session_state["test_index"]  = tst.index.to_numpy()
+    st.session_state["embedding_used"] = f"Word2Vec({'SIF' if use_sif else 'mean'}{'-PCrm' if (use_sif and remove_pc) else ''}{'-L2' if do_l2 else ''})"
 
-    # 7) Optional: export a small embeddings sample
-    st.markdown("#### Download a small sample (for your report)")
-    max_rows = min(5000, len(work_df))
-    sample_n = st.slider("Rows to include", 500, max_rows, min(1000, max_rows), 500)
-    if st.button("Create sample CSV"):
-        sample = pd.DataFrame(X_emb[:sample_n], columns=[f"v{i + 1}" for i in range(dim)])
-        sample["Emotion"] = work_df["Emotion"].iloc[:sample_n].values
-        sample["Score"] = work_df["Score"].iloc[:sample_n].values
-        st.download_button(
-            "Download embeddings sample",
-            data=sample.to_csv(index=False).encode("utf-8"),
-            file_name="embeddings_sample.csv",
-            mime="text/csv"
-        )
+    st.success("Per-review embeddings are ready ✅ — proceed to **Modeling & Results**.")
+    st.caption("Note: Multi-threaded W2V can have tiny non-determinism across runs; a fixed seed reduces this.")
 
 
-def page_modeling():
+
+def page_modeling_and_results():
     """
-    Train and compare Random Forest & XGBoost on Word2Vec review embeddings.
-    - Handles imbalance via Class Weights or SMOTE (train folds only).
-    - Reports macro-averaged metrics (precision/recall/F1/ROC-AUC) via CV.
-    - Trains on a hold-out split for confusion matrices and ROC curves.
-    - Shows compact feature-importance plots (top embedding dimensions).
-    Saves a 'results' bundle in st.session_state for the Evaluation page.
+    One-page: train Random Forest & XGBoost on Word2Vec embeddings and show results.
+    Pipeline:
+      - Uses saved TRAIN/TEST indices from the Word2Vec page (prevents leakage).
+      - Runs Stratified K-Fold CV on TRAIN ONLY (orthodox).
+      - Optional imbalance handling: Class weights (RF & XGB via sample weights) or SMOTE (TRAIN-only).
+      - Reports macro metrics for CV and held-out TEST; shows CMs, ROC curves, importances.
+      - Persists models + results bundle in st.session_state.
     """
 
-    # Optional deps
-    try:
-        from xgboost import XGBClassifier
-        XGB_OK = True
-    except Exception:
-        XGB_OK = False
-    try:
-        from imblearn.over_sampling import SMOTE
-        SMOTE_OK = True
-    except Exception:
-        SMOTE_OK = False
+    st.title("Modeling & Results — Random Forest vs XGBoost")
+    st.caption("Stratified CV on TRAIN only + final held-out TEST evaluation. Macro metrics throughout.")
 
-    st.title(" Modeling — Random Forest vs XGBoost")
-    st.markdown("""
-    Purpose: Train and compare two classifiers — **Random Forest** and **XGBoost** — on the Word2Vec review embeddings to predict the **Emotion** class (Negative / Neutral / Positive).
+    # --------- Pull data from session ---------
+    X = st.session_state.get("X_emb")
+    y = st.session_state.get("y_labels")
+    label_map = st.session_state.get("label_map")
+    tr_idx = st.session_state.get("train_index")
+    te_idx = st.session_state.get("test_index")
+    emb_used = st.session_state.get("embedding_used", "Word2Vec(mean)")
 
-    """)
-
-    # 0) Fetch features/labels
-    X = st.session_state.get("X_emb", None)
-    y = st.session_state.get("y_labels", None)
-    label_map = st.session_state.get("label_map", None)
-
-    if X is None or y is None or label_map is None:
-        st.error("Embeddings not found. Please run **Word2Vec — Train & Vectorize** first.")
+    if any(v is None for v in [X, y, label_map, tr_idx, te_idx]):
+        st.error("Embeddings or indices missing. Please run **Embeddings (Word2Vec)** first.")
         st.stop()
 
     classes_sorted = [k for k, _ in sorted(label_map.items(), key=lambda kv: kv[1])]
     labels_indices = np.array([label_map[c] for c in classes_sorted])
     n_classes = len(classes_sorted)
-    st.write(f"Features: **{X.shape}**, Classes: **{classes_sorted}**")
+    st.write(f"Features: **{X.shape}**  |  Classes: **{classes_sorted}**")
+    st.caption(f"Embedding used: **{emb_used}**")
 
-    #  1) Controls
+    # --------- TRAIN / TEST split (fixed from Word2Vec page) ---------
+    X_tr, X_te = X[tr_idx], X[te_idx]
+    y_tr, y_te = y[tr_idx], y[te_idx]
+    st.caption(f"Train counts: {dict(Counter(y_tr))}  |  Test counts: {dict(Counter(y_te))}")
+
+    # --------- Controls ---------
     with st.expander("🎛 Training Controls", expanded=True):
         c1, c2, c3 = st.columns(3)
         with c1:
-            test_size = st.slider("Test size", 0.10, 0.40, 0.20, 0.05)
-            n_splits = st.number_input("CV folds (StratifiedKFold)", 3, 10, 5, 1)
+            n_splits = int(st.number_input("CV folds (StratifiedKFold on TRAIN)", 3, 10, 5, 1))
+            random_state = int(st.number_input("random_state", 0, 9999, 42, 1))
         with c2:
-            imb = st.selectbox(
-                "Imbalance handling",
-                ["Class weights", "SMOTE", "None"],
-                help="SMOTE is applied on TRAIN folds only; Class weights uses balanced weighting."
-            )
+            imb = st.selectbox("Imbalance handling", ["Class weights", "SMOTE", "None"],
+                               help="SMOTE and class weights applied only on TRAIN folds and final TRAIN fit.")
         with c3:
-            random_state = st.number_input("random_state", 0, 9999, 42, 1)
+            # RF params
+            rf_n_estimators    = int(st.number_input("RF n_estimators", 100, 2000, 400, 50))
+            rf_max_depth       = int(st.number_input("RF max_depth (0=None)", 0, 200, 0, 1))
+            rf_min_samples_leaf= int(st.number_input("RF min_samples_leaf", 1, 20, 1, 1))
 
-    # RF params
-    with st.expander(" Random Forest Hyper‑parameters"):
-        rf_n_estimators = st.number_input("n_estimators", 100, 2000, 400, 50)
-        rf_max_depth = st.number_input("max_depth (0 = None)", 0, 200, 0, 1)
-        rf_min_samples_leaf = st.number_input("min_samples_leaf", 1, 20, 1, 1)
-
-    # XGB params
-    with st.expander("⚡ XGBoost Hyper‑parameters"):
+    with st.expander("⚡ XGBoost Hyper-parameters", expanded=True):
         if not XGB_OK:
-            st.warning("XGBoost not installed — results will include only Random Forest.")
-        xgb_n_estimators = st.number_input("n_estimators", 100, 2000, 600, 50)
-        xgb_learning_rate = st.number_input("learning_rate", 0.01, 0.5, 0.1, 0.01)
-        xgb_max_depth = st.number_input("max_depth", 2, 20, 6, 1)
-        xgb_subsample = st.slider("subsample", 0.5, 1.0, 0.8, 0.05)
-        xgb_colsample = st.slider("colsample_bytree", 0.5, 1.0, 0.8, 0.05)
-        xgb_reg_lambda = st.number_input("lambda (L2)", 0.0, 10.0, 1.0, 0.1)
+            st.warning("XGBoost not installed — only Random Forest will run.")
+        xgb_n_estimators = int(st.number_input("xgb n_estimators", 100, 2000, 600, 50))
+        xgb_lr           = float(st.number_input("learning_rate", 0.01, 0.5, 0.1, 0.01))
+        xgb_max_depth    = int(st.number_input("max_depth", 2, 20, 6, 1))
+        xgb_subsample    = float(st.slider("subsample", 0.5, 1.0, 0.8, 0.05))
+        xgb_colsample    = float(st.slider("colsample_bytree", 0.5, 1.0, 0.8, 0.05))
+        xgb_reg_lambda   = float(st.number_input("lambda (L2)", 0.0, 10.0, 1.0, 0.1))
+        use_early_stop   = st.checkbox("Use early stopping (uses 15% of TRAIN as val)", value=True)
 
-    # Ensure numeric types from widgets
-    test_size = float(test_size)
-    n_splits = int(n_splits)
-    random_state = int(random_state)
-    rf_n_estimators = int(rf_n_estimators)
-    rf_max_depth = int(rf_max_depth)
-    rf_min_samples_leaf = int(rf_min_samples_leaf)
-    xgb_n_estimators = int(xgb_n_estimators)
-    xgb_learning_rate = float(xgb_learning_rate)
-    xgb_max_depth = int(xgb_max_depth)
-    xgb_subsample = float(xgb_subsample)
-    xgb_colsample = float(xgb_colsample)
-    xgb_reg_lambda = float(xgb_reg_lambda)
-
-    # Helper: per-sample weights to emulate class_weight for XGB
+    # helper: sample weights for class weighting
     def sample_weights(y_vec):
         classes, counts = np.unique(y_vec, return_counts=True)
         total = len(y_vec)
         w = {c: total / (len(classes) * cnt) for c, cnt in zip(classes, counts)}
         return np.array([w[yi] for yi in y_vec])
 
-    #  2) Train/Test split
-    if st.button(" Train & Compare"):
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
-        )
-        st.caption("Train class counts: " + str(dict(Counter(y_tr))))
-        st.caption("Test  class counts: " + str(dict(Counter(y_te))))
-
-        # Optionally balance training set
-        sw_tr = None
+    # --------- Train button ---------
+    if st.button(" Train & Evaluate ", type="primary"):
+        # Optionally rebalance TRAIN
         rf_class_weight = None
+        sw_tr = None
+        Xtr_fit, ytr_fit = X_tr, y_tr  # local copies for final fit
 
         if imb == "Class weights":
             rf_class_weight = "balanced"
             sw_tr = sample_weights(y_tr)
         elif imb == "SMOTE":
-            if not SMOTE_OK:
-                st.warning("SMOTE unavailable (install `imbalanced-learn`). Continuing without SMOTE.")
-            else:
+            if SMOTE_OK:
                 sm = SMOTE(random_state=random_state)
-                X_tr, y_tr = sm.fit_resample(X_tr, y_tr)
-                st.info(f"SMOTE applied on train: X_train → {X_tr.shape}")
+                Xtr_fit, ytr_fit = sm.fit_resample(X_tr, y_tr)
+                st.info(f"SMOTE applied on TRAIN for final fit: {X_tr.shape} → {Xtr_fit.shape}")
+            else:
+                st.warning("SMOTE unavailable (install `imbalanced-learn`). Continuing without SMOTE.")
 
-        #  3) Cross‑validation (macro metrics)
+        # --------- CV on TRAIN only ---------
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
         def cv_eval(clf, uses_sample_weight=False):
             precs, recs, f1s, aucs = [], [], [], []
-            for tr_idx, va_idx in skf.split(X, y):
-                Xtr, Xva = X[tr_idx], X[va_idx]
-                ytr, yva = y[tr_idx], y[va_idx]
+            for tr_i, va_i in skf.split(X_tr, y_tr):
+                XtrF, XvaF = X_tr[tr_i], X_tr[va_i]
+                ytrF, yvaF = y_tr[tr_i], y_tr[va_i]
 
-                # Re-apply SMOTE in each fold (train only)
+                # SMOTE on fold-train only
                 if imb == "SMOTE" and SMOTE_OK:
                     sm = SMOTE(random_state=random_state)
-                    Xtr, ytr = sm.fit_resample(Xtr, ytr)
+                    XtrF, ytrF = sm.fit_resample(XtrF, ytrF)
 
-                sw = sample_weights(ytr) if (imb == "Class weights" and uses_sample_weight) else None
-                clf.fit(Xtr, ytr, sample_weight=sw) if uses_sample_weight else clf.fit(Xtr, ytr)
+                swF = sample_weights(ytrF) if (imb == "Class weights" and uses_sample_weight) else None
+                clf.fit(XtrF, ytrF, sample_weight=swF) if uses_sample_weight else clf.fit(XtrF, ytrF)
 
-                proba = clf.predict_proba(Xva)
-                # Safe clipping to avoid numeric edge cases in ROC
-                proba = np.clip(proba, 1e-8, 1 - 1e-8)
-
-                yva_bin = label_binarize(yva, classes=np.unique(y))
+                proba = np.clip(clf.predict_proba(XvaF), 1e-8, 1 - 1e-8)
+                yva_bin = label_binarize(yvaF, classes=np.arange(n_classes))
                 try:
                     auc = roc_auc_score(yva_bin, proba, average="macro", multi_class="ovr")
                 except Exception:
                     auc = np.nan
-                preds = clf.predict(Xva)
+                preds = clf.predict(XvaF)
 
-                precs.append(precision_score(yva, preds, average="macro", zero_division=0))
-                recs.append(recall_score(yva, preds, average="macro", zero_division=0))
-                f1s.append(f1_score(yva, preds, average="macro", zero_division=0))
+                precs.append(precision_score(yvaF, preds, average="macro", zero_division=0))
+                recs.append(recall_score(yvaF, preds, average="macro", zero_division=0))
+                f1s.append(f1_score(yvaF, preds, average="macro", zero_division=0))
                 aucs.append(auc)
-            return np.nanmean(precs), np.nanmean(recs), np.nanmean(f1s), np.nanmean(aucs)
+            return float(np.nanmean(precs)), float(np.nanmean(recs)), float(np.nanmean(f1s)), float(np.nanmean(aucs))
 
-        #  Train & collect results
-        metrics_rows = []                 # for results["metrics"]
-        conf_matrices = {}               # for results["conf_matrices"]
-        roc_curves = {}                  # for results["roc_curves"]
-        feature_importance = {}          # for results["feature_importance"]
+        metrics_rows = []
+        conf_matrices = {}
+        roc_curves = {}
+        feature_importance = {}
 
-        #  Random Forest
+        # ----- Random Forest -----
         rf_kwargs = dict(
             n_estimators=rf_n_estimators,
             min_samples_leaf=rf_min_samples_leaf,
@@ -915,42 +1014,42 @@ def page_modeling():
             rf_kwargs["class_weight"] = rf_class_weight
 
         rf = RandomForestClassifier(**rf_kwargs)
-        rf_p, rf_r, rf_f1, rf_auc = cv_eval(rf, uses_sample_weight=False)
+        rf_cvP, rf_cvR, rf_cvF1, rf_cvAUC = cv_eval(rf, uses_sample_weight=False)
 
-        # Fit on train for confusion matrix / ROC / accuracy
-        rf.fit(X_tr, y_tr)
+        # Fit on (optionally rebalanced) TRAIN and eval on TEST
+        rf.fit(Xtr_fit, ytr_fit)
         rf_preds = rf.predict(X_te)
         rf_prob = np.clip(rf.predict_proba(X_te), 1e-8, 1 - 1e-8)
         rf_acc = accuracy_score(y_te, rf_preds)
-
-        y_te_bin = label_binarize(y_te, classes=labels_indices)
+        y_te_bin = label_binarize(y_te, classes=np.arange(n_classes))
         try:
             rf_auc_macro = roc_auc_score(y_te_bin, rf_prob, average="macro", multi_class="ovr")
             fpr_rf, tpr_rf, _ = roc_curve(y_te_bin.ravel(), rf_prob.ravel())
         except Exception:
-            rf_auc_macro = np.nan
-            fpr_rf, tpr_rf = np.array([0, 1]), np.array([0, 1])
+            rf_auc_macro = np.nan; fpr_rf, tpr_rf = np.array([0,1]), np.array([0,1])
 
         metrics_rows.append({
             "Model": "Random Forest",
-            "Precision": rf_p, "Recall": rf_r, "F1": rf_f1,
-            "ROC-AUC": rf_auc, "Accuracy": rf_acc
+            "CV_Precision": rf_cvP, "CV_Recall": rf_cvR, "CV_F1": rf_cvF1, "CV_ROC-AUC": rf_cvAUC,
+            "Test_Precision": precision_score(y_te, rf_preds, average="macro", zero_division=0),
+            "Test_Recall": recall_score(y_te, rf_preds, average="macro", zero_division=0),
+            "Test_F1": f1_score(y_te, rf_preds, average="macro", zero_division=0),
+            "Test_ROC-AUC": rf_auc_macro,
+            "Test_Accuracy": rf_acc
         })
-        conf_matrices["Random Forest"] = confusion_matrix(y_te, rf_preds, labels=labels_indices)
+        conf_matrices["Random Forest"] = confusion_matrix(y_te, rf_preds, labels=np.arange(n_classes))
         roc_curves["Random Forest"] = (fpr_rf, tpr_rf, rf_auc_macro)
-
-        # Feature importance (embedding dims)
         if hasattr(rf, "feature_importances_"):
             feature_importance["Random Forest"] = {
                 "features": [f"dim_{i}" for i in range(X.shape[1])],
                 "importance": rf.feature_importances_.tolist()
             }
 
-        #  XGBoost
+        # ----- XGBoost -----
         if XGB_OK:
             xgb = XGBClassifier(
                 n_estimators=xgb_n_estimators,
-                learning_rate=xgb_learning_rate,
+                learning_rate=xgb_lr,
                 max_depth=xgb_max_depth,
                 subsample=xgb_subsample,
                 colsample_bytree=xgb_colsample,
@@ -961,26 +1060,45 @@ def page_modeling():
                 n_jobs=-1,
                 random_state=random_state,
             )
-            xgb_p, xgb_r, xgb_f1, xgb_auc = cv_eval(xgb, uses_sample_weight=(imb == "Class weights"))
-            sw = sample_weights(y_tr) if (imb == "Class weights") else None
-            xgb.fit(X_tr, y_tr, sample_weight=sw)
+            xgb_cvP, xgb_cvR, xgb_cvF1, xgb_cvAUC = cv_eval(xgb, uses_sample_weight=(imb == "Class weights"))
+
+            # early stopping using a split from TRAIN (never touch TEST)
+            if use_early_stop:
+                Xtr2, Xva2, ytr2, yva2 = train_test_split(
+                    Xtr_fit, ytr_fit, test_size=0.15, stratify=ytr_fit, random_state=random_state
+                )
+                sw2 = sample_weights(ytr2) if (imb == "Class weights") else None
+                xgb.fit(
+                    Xtr2, ytr2,
+                    sample_weight=sw2,
+                    eval_set=[(Xva2, yva2)],
+                    eval_metric="mlogloss",
+                    verbose=False,
+                    early_stopping_rounds=30
+                )
+            else:
+                sw2 = sample_weights(ytr_fit) if (imb == "Class weights") else None
+                xgb.fit(Xtr_fit, ytr_fit, sample_weight=sw2)
+
             xgb_preds = xgb.predict(X_te)
             xgb_prob = np.clip(xgb.predict_proba(X_te), 1e-8, 1 - 1e-8)
             xgb_acc = accuracy_score(y_te, xgb_preds)
-
             try:
                 xgb_auc_macro = roc_auc_score(y_te_bin, xgb_prob, average="macro", multi_class="ovr")
                 fpr_xgb, tpr_xgb, _ = roc_curve(y_te_bin.ravel(), xgb_prob.ravel())
             except Exception:
-                xgb_auc_macro = np.nan
-                fpr_xgb, tpr_xgb = np.array([0, 1]), np.array([0, 1])
+                xgb_auc_macro = np.nan; fpr_xgb, tpr_xgb = np.array([0,1]), np.array([0,1])
 
             metrics_rows.append({
                 "Model": "XGBoost",
-                "Precision": xgb_p, "Recall": xgb_r, "F1": xgb_f1,
-                "ROC-AUC": xgb_auc, "Accuracy": xgb_acc
+                "CV_Precision": xgb_cvP, "CV_Recall": xgb_cvR, "CV_F1": xgb_cvF1, "CV_ROC-AUC": xgb_cvAUC,
+                "Test_Precision": precision_score(y_te, xgb_preds, average="macro", zero_division=0),
+                "Test_Recall": recall_score(y_te, xgb_preds, average="macro", zero_division=0),
+                "Test_F1": f1_score(y_te, xgb_preds, average="macro", zero_division=0),
+                "Test_ROC-AUC": xgb_auc_macro,
+                "Test_Accuracy": xgb_acc
             })
-            conf_matrices["XGBoost"] = confusion_matrix(y_te, xgb_preds, labels=labels_indices)
+            conf_matrices["XGBoost"] = confusion_matrix(y_te, xgb_preds, labels=np.arange(n_classes))
             roc_curves["XGBoost"] = (fpr_xgb, tpr_xgb, xgb_auc_macro)
 
             if hasattr(xgb, "feature_importances_"):
@@ -988,370 +1106,110 @@ def page_modeling():
                     "features": [f"dim_{i}" for i in range(X.shape[1])],
                     "importance": xgb.feature_importances_.tolist()
                 }
-        else:
-            st.info("XGBoost not installed; skipping XGB metrics.")
-
-        #  4) Side‑by‑side results
-        st.subheader(" Side‑by‑Side Results (macro)")
-        res_df = pd.DataFrame(metrics_rows).set_index("Model")
-        st.dataframe(res_df.style.format("{:.4f}"), use_container_width=True)
-
-        #  5) Confusion matrices
-        st.subheader(" Confusion Matrices")
-        fig, axes = plt.subplots(1, 2 if "XGBoost" in conf_matrices else 1, figsize=(12, 4))
-        if not isinstance(axes, np.ndarray):
-            axes = np.array([axes])
-
-        cm_rf = conf_matrices["Random Forest"]
-        sns.heatmap(cm_rf, annot=True, fmt="d", cmap="Blues", ax=axes[0],
-                    xticklabels=classes_sorted, yticklabels=classes_sorted)
-        axes[0].set_title("Random Forest"); axes[0].set_xlabel("Predicted"); axes[0].set_ylabel("True")
-
-        if "XGBoost" in conf_matrices:
-            cm_xgb = conf_matrices["XGBoost"]
-            sns.heatmap(cm_xgb, annot=True, fmt="d", cmap="Greens", ax=axes[1],
-                        xticklabels=classes_sorted, yticklabels=classes_sorted)
-            axes[1].set_title("XGBoost"); axes[1].set_xlabel("Predicted"); axes[1].set_ylabel("True")
-
-        st.pyplot(fig)
-
-        #  6) ROC curves
-        st.subheader(" ROC Curves (macro AUC reported; curve is micro-style)")
-        try:
-            fig2, ax2 = plt.subplots()
-            fpr_rf, tpr_rf, auc_rf = roc_curves["Random Forest"]
-            ax2.plot(fpr_rf, tpr_rf, label=f"Random Forest (AUC={auc_rf:.3f})")
-            if "XGBoost" in roc_curves:
-                fpr_xgb, tpr_xgb, auc_xgb = roc_curves["XGBoost"]
-                ax2.plot(fpr_xgb, tpr_xgb, label=f"XGBoost (AUC={auc_xgb:.3f})")
-            ax2.plot([0, 1], [0, 1], 'k--', label="Random Guess")
-            ax2.set_xlabel("False Positive Rate"); ax2.set_ylabel("True Positive Rate")
-            ax2.legend()
-            st.pyplot(fig2)
-        except Exception:
-            st.info("Could not render ROC curves (probabilities/labels issue).")
-
-        # 7) Save everything for Evaluation page
-        st.session_state["rf_model"] = rf
-        if XGB_OK:
             st.session_state["xgb_model"] = xgb
+        else:
+            st.info("XGBoost not available; skipping XGB metrics.")
 
-        st.session_state["results"] = {
+        # Persist models & results
+        st.session_state["rf_model"] = rf
+        results_bundle = {
             "metrics": metrics_rows,
             "conf_matrices": conf_matrices,
-            "labels": classes_sorted,          # used as tick labels on Evaluation page
+            "labels": classes_sorted,
             "roc_curves": roc_curves,
-            "feature_importance": feature_importance
+            "feature_importance": feature_importance,
+            "embedding_used": emb_used
         }
+        st.session_state["results"] = results_bundle
 
-        #  8) Feature importance plots (compact)
-        st.subheader(" Feature Importance (Top Embedding Dimensions)")
+        # --------- Presentation ---------
+        res_df = pd.DataFrame(metrics_rows).set_index("Model")
+        st.subheader("Results (CV on TRAIN vs Held-out TEST)")
+        st.dataframe(res_df.style.format("{:.4f}"), use_container_width=True)
 
-        def plot_top_importances(model_name: str, importances: list, top_k: int = 15):
-            """Render a horizontal bar chart of top_k most important embedding dims."""
-            if not importances:
-                st.info(f"No importances available for {model_name}.")
-                return
-            imp = np.asarray(importances)
-            dims = np.array([f"dim_{i}" for i in range(len(importances))])
+        # Winner by Test_F1 then Test_ROC-AUC
+        winner = max(res_df.index, key=lambda m: (res_df.loc[m, "Test_F1"], res_df.loc[m, "Test_ROC-AUC"]))
+        st.success(f"🏆 Overall winner (TEST): **{winner}**")
 
-            order = np.argsort(imp)[::-1][:top_k]
-            top_df = pd.DataFrame({
-                "Feature": dims[order],
-                "Importance": imp[order]
-            })
-
-            # Table
-            st.markdown(f"**{model_name} — Top {top_k} dimensions**")
-            st.dataframe(top_df, use_container_width=True)
-
-            # Plot
-            fig_imp, ax_imp = plt.subplots(figsize=(6, 4.5))
-            sns.barplot(data=top_df, y="Feature", x="Importance", ax=ax_imp)
-            ax_imp.set_title(f"{model_name}: Top {top_k} Feature Importances")
-            ax_imp.set_xlabel("Importance")
-            ax_imp.set_ylabel("Embedding Dimension")
-            st.pyplot(fig_imp)
-
-        fi = feature_importance  # already built above
-        cols = st.columns(2 if "XGBoost" in fi else 1)
-        with cols[0]:
-            if "Random Forest" in fi:
-                plot_top_importances("Random Forest", fi["Random Forest"]["importance"], top_k=15)
-            else:
-                st.info("Random Forest importances not available.")
-
-        if "XGBoost" in fi and len(cols) > 1:
-            with cols[1]:
-                plot_top_importances("XGBoost", fi["XGBoost"]["importance"], top_k=15)
-
-        st.success("Training complete ✅ — metrics, plots, and importances ready.")
-
-
-
-def page_ModelEvaluation_and_Results():
-    """
-    Display evaluation metrics, confusion matrices, ROC curves, and feature importances
-    using the results bundle saved by the Modeling page in st.session_state["results"].
-    """
-
-    st.title(" Model Evaluation & Results")
-    st.markdown("""
-    ###
-    This page presents the **evaluation results** of the machine learning models trained on the *Modeling* page.  
-    It summarizes how well each model performed on a **held-out test set** and helps in understanding their predictive strengths and weaknesses.
-    """)
-
-    #  1) Retrieve saved results
-    results = st.session_state.get("results", None)
-    if results is None:
-        st.error("⚠ No saved results found. Please run the **Modeling** page first.")
-        st.stop()
-
-    metrics_rows = results.get("metrics", [])
-    conf_matrices = results.get("conf_matrices", {})
-    labels = results.get("labels", None)  # display order of classes
-    roc_curves = results.get("roc_curves", {})
-    feature_importance = results.get("feature_importance", {})
-
-    if not metrics_rows or labels is None:
-        st.error("⚠ Results object is incomplete. Re‑run the **Modeling** page.")
-        st.stop()
-
-    # 2) Metrics table
-    st.subheader(" Evaluation Metrics (macro)")
-    metrics_df = pd.DataFrame(metrics_rows).set_index("Model")
-
-    # Format only numeric cols safely
-    fmt_map = {col: "{:.4f}" for col in metrics_df.select_dtypes(include=["float", "int"]).columns}
-    st.dataframe(metrics_df.style.format(fmt_map), use_container_width=True)
-
-    # Download metrics CSV
-    st.download_button(
-        " Download metrics (CSV)",
-        data=metrics_df.to_csv().encode("utf-8"),
-        file_name="model_metrics.csv",
-        mime="text/csv"
-    )
-
-    #  3) Confusion matrices
-    st.subheader(" Confusion Matrices (hold‑out test)")
-    model_names = list(conf_matrices.keys())
-    if not model_names:
-        st.info("No confusion matrices found in results.")
-        cm_rf = None
-        cm_xgb = None
-    else:
-        n_panels = len(model_names)
-        fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 4))
-        if n_panels == 1:
-            axes = np.array([axes])
-
-        cm_rf = conf_matrices.get("Random Forest")
-        cm_xgb = conf_matrices.get("XGBoost")
-
-        idx = 0
-        for mname in model_names:
-            ax = axes[idx]
-            cm = np.asarray(conf_matrices[mname])
-            sns.heatmap(cm, annot=True, fmt="d",
-                        cmap="Blues" if "Forest" in mname else "Greens",
-                        ax=ax, xticklabels=labels, yticklabels=labels)
-            ax.set_title(mname)
-            ax.set_xlabel("Predicted");
-            ax.set_ylabel("True")
-            idx += 1
-        st.pyplot(fig)
-
-    #  4) ROC curves
-    st.subheader(" ROC Curves (macro AUC reported; curve is micro‑style)")
-    if not roc_curves:
-        st.info("No ROC data available. Re‑run the Modeling page.")
-    else:
-        fig2, ax2 = plt.subplots()
-        for mname, (fpr, tpr, auc_macro) in roc_curves.items():
-            fpr = np.asarray(fpr);
-            tpr = np.asarray(tpr)
-            label = f"{mname} (AUC={auc_macro:.3f})" if np.isfinite(auc_macro) else f"{mname} (AUC=n/a)"
-            ax2.plot(fpr, tpr, label=label)
-        ax2.plot([0, 1], [0, 1], "k--", label="Random guess")
-        ax2.set_xlabel("False Positive Rate")
-        ax2.set_ylabel("True Positive Rate")
-        ax2.legend()
-        st.pyplot(fig2)
-
-    # 5) Feature importances (top embedding dimensions)
-    st.subheader(" Feature Importance (Top Embedding Dimensions)")
-
-    def plot_top_importances(model_name: str, fi_dict: dict, top_k: int = 15):
-        if not fi_dict or "importance" not in fi_dict:
-            st.info(f"No importances available for {model_name}.")
-            return
-        imp = np.asarray(fi_dict["importance"])
-        dims = np.array(fi_dict.get("features", [f"dim_{i}" for i in range(len(imp))]))
-        order = np.argsort(imp)[::-1][:top_k]
-        top_df = pd.DataFrame({"Feature": dims[order], "Importance": imp[order]})
-
-        st.markdown(f"**{model_name} — Top {top_k} dimensions**")
-        st.dataframe(top_df, use_container_width=True)
-
-        fig, ax = plt.subplots(figsize=(6, 4.5))
-        sns.barplot(data=top_df, y="Feature", x="Importance", ax=ax)
-        ax.set_title(f"{model_name}: Top {top_k} Feature Importances")
-        ax.set_xlabel("Importance")
-        ax.set_ylabel("Embedding Dimension")
-        st.pyplot(fig)
-
-    cols = st.columns(2 if "XGBoost" in feature_importance else 1)
-    with cols[0]:
-        if "Random Forest" in feature_importance:
-            plot_top_importances("Random Forest", feature_importance["Random Forest"], top_k=15)
-        else:
-            st.info("Random Forest importances not available.")
-    if "XGBoost" in feature_importance and len(cols) > 1:
-        with cols[1]:
-            plot_top_importances("XGBoost", feature_importance["XGBoost"], top_k=15)
-
-    # 6) Interpretation & Recommendations (with highlights)
-    # Small CSS for colored badges
-    st.markdown("""
-           <style>
-           .badge {display:inline-block; padding:2px 8px; border-radius:12px; font-size:0.85rem; font-weight:600; margin:0 4px;}
-           .bg-green {background:#e6f4ea; color:#127a2a; border:1px solid #b7e2c0;}
-           .bg-blue  {background:#e8f0fe; color:#1b4dd7; border:1px solid #c6d2ff;}
-           .bg-red   {background:#fdecea; color:#b3261e; border:1px solid #f6c7c3;}
-           .bg-amber {background:#fff7e6; color:#8a5a00; border:1px solid #ffe0a3;}
-           .chip     {display:inline-block; padding:2px 8px; border-radius:16px; font-size:0.80rem; font-weight:600; margin-left:6px;}
-           .chip-neutral {background:#eef2f7; color:#334155; border:1px solid #cbd5e1;}
-           </style>
-       """, unsafe_allow_html=True)
-
-    st.markdown("##  Interpretation & Recommendations")
-
-    def _class_metrics_from_cm(cm: np.ndarray, class_names: list[str]) -> pd.DataFrame:
-        tp = np.diag(cm).astype(float)
-        support = cm.sum(axis=1).astype(float)  # true counts
-        predsum = cm.sum(axis=0).astype(float)  # predicted counts
-        recall = np.divide(tp, support, out=np.zeros_like(tp), where=support > 0)
-        precision = np.divide(tp, predsum, out=np.zeros_like(tp), where=predsum > 0)
-        f1 = np.divide(2 * precision * recall, precision + recall,
-                       out=np.zeros_like(tp), where=(precision + recall) > 0)
-        return pd.DataFrame({
-            "Class": class_names,
-            "Precision": precision,
-            "Recall": recall,
-            "F1": f1,
-            "Support": support.astype(int)
-        })
-
-    # Per‑class tables (hold‑out)
-    per_class_rf = _class_metrics_from_cm(cm_rf, labels) if cm_rf is not None else None
-    if per_class_rf is not None:
-        st.markdown("**Random Forest — class‑wise metrics (hold‑out):**")
-        st.dataframe(per_class_rf.style.format({"Precision": "{:.3f}", "Recall": "{:.3f}", "F1": "{:.3f}"}),
-                     use_container_width=True)
-
-    per_class_xgb = _class_metrics_from_cm(cm_xgb, labels) if cm_xgb is not None else None
-    if per_class_xgb is not None:
-        st.markdown("**XGBoost — class‑wise metrics (hold‑out):**")
-        st.dataframe(per_class_xgb.style.format({"Precision": "{:.3f}", "Recall": "{:.3f}", "F1": "{:.3f}"}),
-                     use_container_width=True)
-
-    # Pull macro rows from metrics table
-    rf_row = metrics_df.loc["Random Forest"].to_dict() if "Random Forest" in metrics_df.index else {}
-    xgb_row = metrics_df.loc["XGBoost"].to_dict() if "XGBoost" in metrics_df.index else None
-
-    # Winner by (macro F1, then ROC‑AUC)
-    def _pick_score(row):
-        return (row.get("F1", 0), row.get("ROC-AUC", 0))
-
-    winner_name = "Random Forest"
-    if xgb_row and _pick_score(xgb_row) > _pick_score(rf_row):
-        winner_name = "XGBoost"
-
-    # Hardest class across available models (lowest recall)
-    hardest_class = None
-    hardest_recall = 1.0
-    for df_ in [d for d in [per_class_rf, per_class_xgb] if d is not None]:
-        idx = df_["Recall"].idxmin()
-        if df_["Recall"].iloc[idx] < hardest_recall:
-            hardest_recall = float(df_["Recall"].iloc[idx])
-            hardest_class = df_["Class"].iloc[idx]
-
-    # Header chips
-    st.markdown(
-        f'**Overall winner:** <span class="badge bg-green">{winner_name}</span> '
-        f'&nbsp;&nbsp;|&nbsp;&nbsp; '
-        f'**Hardest class (lowest recall):** '
-        f'<span class="badge bg-red">{hardest_class if hardest_class is not None else "N/A"}</span> '
-        f'<span class="chip chip-neutral">≈ {hardest_recall:.3f}</span>',
-        unsafe_allow_html=True
-    )
-
-    # Compact metric badges per model
-    def _model_badges(name: str, row: dict, color_class: str):
-        p = row.get("Precision", np.nan);
-        r = row.get("Recall", np.nan)
-        f1 = row.get("F1", np.nan);
-        auc = row.get("ROC-AUC", np.nan)
-        st.markdown(
-            f'**{name}** '
-            f'<span class="badge {color_class}">Precision {p:.3f}</span>'
-            f'<span class="badge {color_class}">Recall {r:.3f}</span>'
-            f'<span class="badge {color_class}">F1 {f1:.3f}</span>'
-            f'<span class="badge {color_class}">ROC‑AUC {auc:.3f}</span>',
-            unsafe_allow_html=True
+        # Download
+        st.download_button(
+            "Download metrics (CSV)",
+            data=res_df.to_csv().encode("utf-8"),
+            file_name="model_metrics.csv",
+            mime="text/csv"
         )
 
-    if rf_row:
-        _model_badges("Random Forest", rf_row, "bg-blue")
-    if xgb_row:
-        _model_badges("XGBoost", xgb_row, "bg-amber")
+        # Confusion matrices
+        st.subheader("Confusion Matrices — Held-out TEST")
+        n = len(conf_matrices)
+        fig, axes = plt.subplots(1, n, figsize=(6*n, 4))
+        if n == 1: axes = np.array([axes])
+        for ax, (mname, cm) in zip(axes, conf_matrices.items()):
+            sns.heatmap(np.asarray(cm), annot=True, fmt="d",
+                        cmap="Blues" if "Forest" in mname else "Greens",
+                        ax=ax, xticklabels=classes_sorted, yticklabels=classes_sorted)
+            ax.set_title(mname); ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+        st.pyplot(fig)
 
-    st.markdown("### What to Improve Next")
-    st.markdown(
-        """
-        - **Boost recall** on the hardest class (often *Neutral*): try **Class Weights**, **SMOTE/ADASYN**, or **threshold tuning**.
-        - **Richer features**: add **bigrams** (e.g., “not good”), or combine Word2Vec with **TF‑IDF** / **SIF‑weighted** embeddings.
-        - **Hyperparameter tuning**:  
-          • RF — `n_estimators`, `max_depth`, `min_samples_leaf`  
-          • XGB — `learning_rate`, `max_depth`, `n_estimators`, `subsample`, `colsample_bytree`, `reg_lambda`
-        - **Probability calibration** (Platt / isotonic) if you’ll use decision thresholds or cost‑sensitive alerts.
-        """
-    )
+        # ROC curves
+        st.subheader("ROC Curves (macro AUC label; micro-style curve)")
+        fig2, ax2 = plt.subplots()
+        for mname, (fpr, tpr, auc_macro) in roc_curves.items():
+            fpr = np.asarray(fpr); tpr = np.asarray(tpr)
+            ax2.plot(fpr, tpr, label=f"{mname} (AUC={auc_macro:.3f})" if np.isfinite(auc_macro) else f"{mname} (AUC=n/a)")
+        ax2.plot([0,1],[0,1],"k--", label="Random guess")
+        ax2.set_xlabel("False Positive Rate"); ax2.set_ylabel("True Positive Rate"); ax2.legend()
+        st.pyplot(fig2)
 
-    st.success(
-        "✅ Evaluation complete — metrics, confusion matrices, ROC curves, importances, and interpretation displayed.")
+        # Feature importances (top embedding dims)
+        st.subheader("Feature Importance (Top Embedding Dimensions)")
+        def plot_top_importances(model_name: str, fi_dict: dict, top_k: int = 15):
+            if not fi_dict or "importance" not in fi_dict:
+                st.info(f"No importances for {model_name}."); return
+            imp = np.asarray(fi_dict["importance"])
+            dims = np.array(fi_dict.get("features", [f"dim_{i}" for i in range(len(imp))]))
+            order = np.argsort(imp)[::-1][:top_k]
+            top_df = pd.DataFrame({"Feature": dims[order], "Importance": imp[order]})
+            st.markdown(f"**{model_name} — Top {top_k} dims**")
+            st.dataframe(top_df, use_container_width=True)
+            fig, ax = plt.subplots(figsize=(6, 4.5))
+            sns.barplot(data=top_df, y="Feature", x="Importance", ax=ax)
+            ax.set_title(f"{model_name}: Top {top_k} Importances")
+            st.pyplot(fig)
+
+        cols = st.columns(2 if "XGBoost" in feature_importance else 1)
+        with cols[0]:
+            if "Random Forest" in feature_importance: plot_top_importances("Random Forest", feature_importance["Random Forest"])
+        if "XGBoost" in feature_importance and len(cols) > 1:
+            with cols[1]:
+                plot_top_importances("XGBoost", feature_importance["XGBoost"])
+
+        st.info("Done. Results are cached in session for the Predictions page.")
 
 
-
-
-# STEP 7: EMOTION‑SPECIFIC WORD CLOUDS (ultimate)
 
 def page_wordclouds():
     """
-    Generate emotion-specific word clouds for Amazon reviews with robust filtering.
+    Emotion-Specific Word Clouds (Word2Vec-centric)
+    ------------------------------------------------
     Methods:
-      • Contrastive log‑odds (recommended) – most discriminative vs other emotions, VADER gating
-      • TF‑IDF per class (lexical)
-      • Word2Vec centroid (semantic)
-      • Word2Vec centroid (TF‑IDF‑weighted)
+      • Word2Vec centroid (semantic) — cosine similarity to per-emotion centroid
+      • Word2Vec centroid (SIF) — SIF-weighted centroid using TRAIN frequencies
+      • Contrastive log-odds — purely frequency-based baseline (no TF-IDF)
 
-    Visual-only filters (do not affect modeling):
-      • Token sanity (alphabetic 3–15 chars)
-      • Global document frequency floor (drop ultra-rare/garbled tokens)
-      • Per-emotion frequency floor (min count within that emotion)
-      • VADER polarity gating for Pos/Neg/Neu
-      • Brand/product stop-list
+    Visual filters (display-only): token sanity, global doc freq floor, per-class min freq,
+    domain/custom stoplists, optional VADER polarity gating.
+
+    Notes:
+    - When 'Use TRAIN only' is ON, all counts/centroids use the TRAIN split from session to avoid leakage.
+    - Word clouds are deterministic via user-set seed.
     """
 
-    st.title(" Emotion‑Specific Word Clouds")
-    st.markdown(""" 
-    This page generates visual word clouds and ranked token tables for each emotion category (Negative, Neutral, Positive), allowing you to explore the most distinctive terms used in reviews for each sentiment.
-    """)
+    st.title("Emotion-Specific Word Clouds")
+    st.caption("Word2Vec-centric clouds with leakage-safe option and deterministic layout.")
 
-    #  guards
-    df_clean = st.session_state.get("df_clean", None)
+    # ---- Guards
+    df_clean = st.session_state.get("df_clean")
     if df_clean is None or "clean_text" not in df_clean.columns or "Emotion" not in df_clean.columns:
         st.error("No cleaned dataset found. Run **Preprocess & Labels** first.")
         st.stop()
@@ -1361,27 +1219,39 @@ def page_wordclouds():
         st.error("No emotion labels available.")
         st.stop()
 
+    w2v_model = st.session_state.get("w2v_model")  # required for centroid methods
+    WV_KEYS = set(w2v_model.wv.key_to_index) if w2v_model is not None else set()
+
     EMO2CMAP = {"Negative": "Reds", "Neutral": "Blues", "Positive": "Greens"}
 
-    # controls
-    method = st.radio(
-        "Weighting method",
-        [
-            "Contrastive log‑odds (recommended)",
-            "TF‑IDF per class (lexical)",
-            "Word2Vec centroid (semantic)",
-            "Word2Vec centroid (TF‑IDF‑weighted)",
-        ],
-        index=0,
+    # ---- Controls
+    c_top = st.columns(2)
+    with c_top[0]:
+        method = st.radio(
+            "Weighting method",
+            ["Word2Vec centroid (semantic)", "Word2Vec centroid (SIF)", "Contrastive log-odds (counts)"],
+            index=0,
+        )
+    with c_top[1]:
+        use_train_only_for_counts = st.checkbox("Use TRAIN only for counts/centroids (avoid leakage)", value=True)
+
+    # Source df for counting/centroids
+    tr_idx = st.session_state.get("train_index")
+    df_counts_source = (
+        df_clean.loc[tr_idx].reset_index(drop=True)
+        if (use_train_only_for_counts and tr_idx is not None)
+        else df_clean
     )
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        top_n = st.slider("Top‑N table / CSV", 20, 100, 50, 5)
-    with c2:
+        top_n = st.slider("Top-N table / CSV", 20, 200, 60, 5)
         cloud_words_cap = st.slider("Words used in each cloud", 60, 300, 180, 20)
-    with c3:
+    with c2:
         background = st.selectbox("Background", ["white", "black"], index=0)
+        seed = st.number_input("Word cloud seed (deterministic)", 0, 9999, 42, 1)
+    with c3:
+        max_vocab_for_similarity = st.slider("Max vocab for similarity (per emotion)", 500, 20000, 5000, 500)
 
     limit_to_emotion_vocab = st.checkbox("Use only tokens appearing in that emotion’s reviews", value=True)
     min_freq_per_emotion = st.number_input("Min frequency in emotion", 1, 100, 10, 1)
@@ -1389,51 +1259,48 @@ def page_wordclouds():
     global_min_df = st.number_input(
         "Global document frequency (min #reviews containing token)",
         1, 1000, 20, 1,
-        help="Higher → fewer rare/garbled tokens (especially helps Neutral).",
+        help="Helps remove rare/garbled tokens (especially Neutral).",
     )
 
-    st.markdown("#### (Optional) Hide brand/product words (visual‑only)")
+    st.markdown("#### Hide brand/product/common words (visual-only)")
     default_stoplist = "amazon, starbucks, folgers, keurig, nespresso, kitkat, trader, joes, walmart, costco"
-    custom_stop = st.text_input("Comma‑separated words to exclude", value=default_stoplist)
+    custom_stop = st.text_input("Comma-separated words to exclude", value=default_stoplist)
     HIDE = set(w.strip().lower() for w in custom_stop.split(",") if w.strip())
 
-    with st.expander("Polarity gate (VADER) for Positive / Negative / Neutral",
-                     expanded=method.startswith("Contrastive")):
-        use_vader = st.checkbox("Gate by VADER polarity", value=True)
+    with st.expander("Optional: Polarity gate (VADER) for Positive/Negative/Neutral", expanded=False):
+        use_vader = st.checkbox("Gate by VADER polarity", value=False)
         pos_thresh = st.slider("Positive threshold (>=)", 0.1, 2.0, 0.5, 0.1)
         neg_thresh = st.slider("Negative threshold (<=)", -2.0, -0.1, -0.5, 0.1)
         neu_band = st.slider("Neutral band (|valence| ≤)", 0.1, 1.0, 0.2, 0.1)
 
-    # domain stop‑list toggle (optional but helpful)
-    use_domain_stop = st.checkbox("Apply domain stop‑list (like, product, good, etc.)", value=True)
+    use_domain_stop = st.checkbox("Apply domain stop-list", value=True)
     DOMAIN_STOP = {
         "like", "taste", "product", "one", "would", "good", "great", "get", "make", "really", "time", "much", "also",
-        "food", "coffee",
-        "tea", "amazon", "buy", "use", "used", "got", "well", "bit", "little", "thing", "things", "even"
+        "food", "coffee", "tea", "amazon", "buy", "use", "used", "got", "well", "bit", "little", "thing", "things", "even"
     }
+    DOMAIN_STOP_TUPLE = tuple(sorted(DOMAIN_STOP))  # cache-friendly
 
-    # - token sanity & global DF
     TOKEN_RE = re.compile(r"^[a-z]+$")
 
     def token_ok(w: str) -> bool:
-        return 3 <= len(w) <= 15 and TOKEN_RE.match(w) is not None and (
-            w not in DOMAIN_STOP if use_domain_stop else True)
+        return 3 <= len(w) <= 15 and TOKEN_RE.match(w) is not None and (w not in DOMAIN_STOP if use_domain_stop else True)
 
-    def get_emotion_tokens(emo: str) -> list[str]:
-        docs = df_clean.loc[df_clean["Emotion"] == emo, "clean_text"].astype(str)
-        return [t for doc in docs for t in doc.split()]
-
+    # ---- Cached global document frequency (dfreq) from the chosen source
     @st.cache_data(show_spinner=False)
-    def build_global_docfreq(dc: pd.DataFrame) -> dict:
+    def build_global_docfreq_from_texts(texts: list[str], use_domain_stop: bool, domain_stop_tuple: tuple) -> dict:
+        token_re = re.compile(r"^[a-z]+$")
         dfreq = Counter()
-        for text in dc["clean_text"].astype(str):
-            toks = set(t for t in text.split() if token_ok(t))
+        stopset = set(domain_stop_tuple) if use_domain_stop else set()
+        for text in texts:
+            toks = set(t for t in text.split() if token_re.match(t) and 3 <= len(t) <= 15 and (t not in stopset))
             dfreq.update(toks)
         return dict(dfreq)
 
-    GLOBAL_DF = build_global_docfreq(df_clean)
+    GLOBAL_DF = build_global_docfreq_from_texts(
+        df_counts_source["clean_text"].astype(str).tolist(), use_domain_stop, DOMAIN_STOP_TUPLE
+    )
 
-    #  VADER polarity sets
+    # ---- Optional VADER polarity sets
     @st.cache_resource(show_spinner=False)
     def vader_sets(pos_thr: float, neg_thr: float, neu_abs: float):
         try:
@@ -1452,25 +1319,26 @@ def page_wordclouds():
     if use_vader:
         POS_SET, NEG_SET, NEU_SET = vader_sets(pos_thresh, neg_thresh, neu_band)
 
-    #  per‑emotion filtered counts
+    # ---- Per-emotion filtered counts (respect token_ok + global_min_df)
+    def get_emotion_tokens(emo: str) -> list[str]:
+        docs = df_counts_source.loc[df_counts_source["Emotion"] == emo, "clean_text"].astype(str)
+        return [t for doc in docs for t in doc.split()]
+
     emo_counts: dict[str, Counter] = {}
     for emo in EMOTIONS:
-        toks = [
-            t for t in get_emotion_tokens(emo)
-            if token_ok(t) and GLOBAL_DF.get(t, 0) >= global_min_df
-        ]
+        toks = [t for t in get_emotion_tokens(emo) if token_ok(t) and GLOBAL_DF.get(t, 0) >= global_min_df]
         emo_counts[emo] = Counter(toks)
 
-    #  renderer helpers
+    # ---- Helpers
     def render_cloud(freqs: dict[str, float], title: str, cmap: str):
         freqs = {w: v for w, v in freqs.items() if w.lower() not in HIDE and v > 0}
         if not freqs:
             st.info(f"No terms to display for **{title}** after filtering.")
             return
-
-        wc = WordCloud(width=1000, height=500, background_color=background,
-                       collocations=False, colormap=cmap)
-        wc = wc.generate_from_frequencies(freqs)
+        wc = WordCloud(
+            width=1000, height=500, background_color=background,
+            collocations=False, colormap=cmap, random_state=int(seed)   # deterministic placement
+        ).generate_from_frequencies(freqs)
 
         fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
         ax.imshow(wc, interpolation="bilinear")
@@ -1480,33 +1348,120 @@ def page_wordclouds():
 
         buf = io.BytesIO()
         fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.1)
+        plt.close(fig)
         st.download_button(
             label=f"Download '{title}' PNG",
             data=buf.getvalue(),
             file_name=f"{title.replace(' ', '_').lower()}.png",
             mime="image/png",
         )
-        plt.close(fig)
 
-        top_items = sorted(freqs.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
-        top_df = pd.DataFrame(top_items, columns=["Word", "Weight"])
-        st.dataframe(top_df, use_container_width=True)
-        st.download_button(
-            label=f"Download '{title}' Top‑{top_n} CSV",
-            data=top_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{title.replace(' ', '_').lower()}_top_{top_n}.csv",
-            mime="text/csv",
-        )
+    def shift_to_nonnegative(items: list[tuple[str, float]]) -> list[tuple[str, float]]:
+        if not items:
+            return items
+        m = min(v for _, v in items)
+        return items if m >= 0 else [(w, v - m) for w, v in items]
 
-    #  compute weights per method
+    def top_table(freqs: dict[str, float], k: int) -> pd.DataFrame:
+        top_items = sorted(freqs.items(), key=lambda kv: kv[1], reverse=True)[:k]
+        return pd.DataFrame(top_items, columns=["Word", "Weight"])
+
+    # Vectorized cosine similarity
+    def top_by_centroid_similarity(centroid_vec: np.ndarray, candidate_words: list[str], k: int):
+        if not candidate_words:
+            return []
+        mat = w2v_model.wv[candidate_words]  # shape (n, d)
+        mat_norm = np.linalg.norm(mat, axis=1) + 1e-12
+        c = centroid_vec / (np.linalg.norm(centroid_vec) + 1e-12)
+        sims = (mat @ c) / mat_norm
+        order = np.argsort(-sims)[:k]
+        return [(candidate_words[i], float(sims[i])) for i in order]
+
+    # ---- Compute per-emotion weights by method
     weights_per_emotion: dict[str, dict[str, float]] = {}
 
-    # A) Contrastive log‑odds
-    if method.startswith("Contrastive"):
-        st.info("Contrastive log‑odds with +1 smoothing (most discriminative vs other emotions). VADER gates applied.")
-        global_counts = Counter()
+    # A) Word2Vec centroid (semantic)
+    if method.startswith("Word2Vec centroid (semantic)"):
+        if w2v_model is None:
+            st.error("Word2Vec model not found. Choose another method or train embeddings first.")
+            st.stop()
+
+        st.info("Cosine similarity to each emotion’s unweighted Word2Vec centroid (semantic).")
+        # Weighted mean by per-emotion token counts (efficient & equivalent to repetition)
+        centroids = {}
         for emo in EMOTIONS:
-            global_counts.update(emo_counts[emo])
+            toks_counts = [(w, c) for w, c in emo_counts[emo].items() if w in WV_KEYS]
+            if not toks_counts:
+                centroids[emo] = None
+                continue
+            mat = np.vstack([w2v_model.wv[w] for w, _ in toks_counts]).astype("float32")
+            ws = np.array([c for _, c in toks_counts], dtype="float32").reshape(-1, 1)
+            centroids[emo] = (mat * ws).sum(axis=0) / (ws.sum() + 1e-12)
+
+        for emo in EMOTIONS:
+            c = centroids[emo]
+            if c is None:
+                weights_per_emotion[emo] = {}
+                continue
+            if limit_to_emotion_vocab:
+                allow = [w for w, cnt in emo_counts[emo].items() if cnt >= min_freq_per_emotion and w in WV_KEYS and token_ok(w)]
+            else:
+                allow = [w for w in w2v_model.wv.key_to_index if token_ok(w)]
+            allow = allow[:max_vocab_for_similarity]
+            top_items = top_by_centroid_similarity(c, allow, cloud_words_cap)
+            top_items = shift_to_nonnegative(top_items)
+            weights_per_emotion[emo] = dict(top_items)
+
+    # B) Word2Vec centroid (SIF)
+    elif method.startswith("Word2Vec centroid (SIF)"):
+        if w2v_model is None:
+            st.error("Word2Vec model not found. Train embeddings first.")
+            st.stop()
+
+        st.info("Cosine similarity to **SIF-weighted** centroids (Word2Vec-only).")
+        # Build SIF from TRAIN if available; else from df_counts_source
+        a = 1e-3
+        if use_train_only_for_counts and tr_idx is not None:
+            train_docs = df_clean.loc[tr_idx, "clean_text"].astype(str).tolist()
+        else:
+            train_docs = df_counts_source["clean_text"].astype(str).tolist()
+
+        train_freq = Counter(t for d in train_docs for t in d.split())
+        total_train_tokens = sum(train_freq.values())
+
+        def sif_w(tok: str) -> float:
+            return a / (a + train_freq.get(tok, 0) / max(total_train_tokens, 1))
+
+        def sif_centroid(counter: Counter) -> np.ndarray | None:
+            toks = [(w, c) for w, c in counter.items() if w in WV_KEYS]
+            if not toks:
+                return None
+            mat = np.vstack([w2v_model.wv[w] for w, _ in toks]).astype("float32")
+            ws = np.array([sif_w(w) * c for w, c in toks], dtype="float32").reshape(-1, 1)
+            return (mat * ws).sum(axis=0) / (ws.sum() + 1e-12)
+
+        centroids = {emo: sif_centroid(emo_counts[emo]) for emo in EMOTIONS}
+
+        for emo in EMOTIONS:
+            c = centroids[emo]
+            if c is None:
+                weights_per_emotion[emo] = {}
+                continue
+            if limit_to_emotion_vocab:
+                allow = [w for w, cnt in emo_counts[emo].items() if cnt >= min_freq_per_emotion and w in WV_KEYS and token_ok(w)]
+            else:
+                allow = [w for w in w2v_model.wv.key_to_index if token_ok(w)]
+            allow = allow[:max_vocab_for_similarity]
+            top_items = top_by_centroid_similarity(c, allow, cloud_words_cap)
+            top_items = shift_to_nonnegative(top_items)
+            weights_per_emotion[emo] = dict(top_items)
+
+    # C) Contrastive log-odds (counts)
+    else:
+        st.info("Contrastive log-odds with +1 smoothing (discriminative vs other emotions).")
+        global_counts = Counter()
+        for e in EMOTIONS:
+            global_counts.update(emo_counts[e])
 
         for emo in EMOTIONS:
             in_counts = emo_counts[emo]
@@ -1517,17 +1472,18 @@ def page_wordclouds():
             in_total = sum(in_counts.values())
             out_total = sum(out_counts.values())
 
-            allowed = {w for w, c in in_counts.items()} if limit_to_emotion_vocab else set(global_counts.keys())
+            allowed = set(in_counts.keys()) if limit_to_emotion_vocab else set(global_counts.keys())
             allowed = {w for w in allowed if in_counts.get(w, 0) >= min_freq_per_emotion}
 
             scores = {}
             for w in allowed:
-                a = in_counts[w] + 1
-                b = (in_total - in_counts[w]) + 1
-                c = out_counts[w] + 1
-                d = (out_total - out_counts[w]) + 1
-                scores[w] = float(np.log(a / b) - np.log(c / d))
+                a_ = in_counts[w] + 1
+                b_ = (in_total - in_counts[w]) + 1
+                c_ = out_counts[w] + 1
+                d_ = (out_total - out_counts[w]) + 1
+                scores[w] = float(np.log(a_ / b_) - np.log(c_ / d_))
 
+            # Optional polarity gating
             if use_vader:
                 if emo == "Positive" and POS_SET:
                     scores = {w: s for w, s in scores.items() if w in POS_SET}
@@ -1537,153 +1493,42 @@ def page_wordclouds():
                     scores = {w: s for w, s in scores.items() if w in NEU_SET}
 
             top_items = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:cloud_words_cap]
-            if top_items:
-                m = min(v for _, v in top_items)
-                if m < 0:
-                    top_items = [(w, v - m) for w, v in top_items]
+            top_items = shift_to_nonnegative(top_items)
             weights_per_emotion[emo] = dict(top_items)
 
-    # B) TF‑IDF per class
-    elif method.startswith("TF‑IDF"):
-        st.info("TF‑IDF within each emotion’s documents (lexical salience).")
-        vectorizer = TfidfVectorizer(tokenizer=str.split, preprocessor=None, lowercase=False, min_df=5, max_df=0.8)
-        for emo in EMOTIONS:
-            docs = df_clean.loc[df_clean["Emotion"] == emo, "clean_text"].astype(str).tolist()
-            clean_docs = []
-            for d in docs:
-                toks = [t for t in d.split() if token_ok(t) and GLOBAL_DF.get(t, 0) >= global_min_df]
-                clean_docs.append(" ".join(toks))
-            if not clean_docs:
-                weights_per_emotion[emo] = {}
-                continue
-            X = vectorizer.fit_transform(clean_docs)
-            vocab = np.array(vectorizer.get_feature_names_out())
-            scores = np.asarray(X.sum(axis=0)).ravel()
-            idx = np.argsort(-scores)[:cloud_words_cap]
-            weights_per_emotion[emo] = {vocab[i]: float(scores[i]) for i in idx}
-
-    # C) Word2Vec centroid (semantic)
-    elif method.startswith("Word2Vec centroid (semantic)"):
-        w2v_model = st.session_state.get("w2v_model", None)
-        if w2v_model is None:
-            st.error("Word2Vec model not found. Run **Word2Vec** or choose another method.")
-            st.stop()
-
-        st.info("Cosine similarity to each emotion’s unweighted Word2Vec centroid (semantic).")
-        centroids = {}
-        for emo in EMOTIONS:
-            toks = [t for t, c in emo_counts[emo].items() for _ in range(c) if t in w2v_model.wv]
-            if not toks:
-                centroids[emo] = None
-                continue
-            vecs = np.vstack([w2v_model.wv[t] for t in toks]).astype("float32")
-            centroids[emo] = vecs.mean(axis=0)
-
-        for emo in EMOTIONS:
-            c = centroids[emo]
-            if c is None:
-                weights_per_emotion[emo] = {}
-                continue
-
-            if limit_to_emotion_vocab:
-                allow = {w for w, cnt in emo_counts[emo].items() if cnt >= min_freq_per_emotion}
-                vocab_words = [w for w in w2v_model.wv.key_to_index if w in allow]
-            else:
-                vocab_words = list(w2v_model.wv.key_to_index.keys())
-
-            c = c / (np.linalg.norm(c) + 1e-12)
-            sims = {}
-            for w in vocab_words:
-                if not token_ok(w):  # keep alpha / length / domain stop
-                    continue
-                v = w2v_model.wv[w]
-                v = v / (np.linalg.norm(v) + 1e-12)
-                sims[w] = float(np.dot(v, c))
-
-            top_items = sorted(sims.items(), key=lambda kv: kv[1], reverse=True)[:cloud_words_cap]
-            if top_items:
-                m = min(val for _, val in top_items)
-                if m < 0:
-                    top_items = [(w, val - m) for w, val in top_items]
-            weights_per_emotion[emo] = dict(top_items)
-
-    # D) Word2Vec centroid (TF‑IDF‑weighted)
-    else:
-        w2v_model = st.session_state.get("w2v_model", None)
-        if w2v_model is None:
-            st.error("Word2Vec model not found. Run **Word2Vec** or choose another method.")
-            st.stop()
-
-        st.info("Cosine similarity to TF‑IDF‑weighted centroids (semantic + lexical).")
-
-        def weighted_centroid(emo: str):
-            docs = df_clean.loc[df_clean["Emotion"] == emo, "clean_text"].astype(str).tolist()
-            clean_docs = []
-            for d in docs:
-                toks = [t for t in d.split() if token_ok(t) and GLOBAL_DF.get(t, 0) >= global_min_df]
-                clean_docs.append(" ".join(toks))
-            if not clean_docs:
-                return None
-            vec = TfidfVectorizer(tokenizer=str.split, preprocessor=None, lowercase=False, min_df=2, max_df=0.9)
-            X = vec.fit_transform(clean_docs)
-            vocab = vec.get_feature_names_out()
-            weights = np.asarray(X.sum(axis=0)).ravel()
-            token2w = {tok: float(w) for tok, w in zip(vocab, weights) if tok in w2v_model.wv and w > 0}
-            if not token2w:
-                return None
-            toks, ws = zip(*token2w.items())
-            mat = np.vstack([w2v_model.wv[t] for t in toks]).astype("float32")
-            w_arr = np.asarray(ws, dtype="float32").reshape(-1, 1)
-            return (mat * w_arr).sum(axis=0) / (w_arr.sum() + 1e-12)
-
-        centroids = {emo: weighted_centroid(emo) for emo in EMOTIONS}
-
-        for emo in EMOTIONS:
-            c = centroids[emo]
-            if c is None:
-                weights_per_emotion[emo] = {}
-                continue
-
-            if limit_to_emotion_vocab:
-                allow = {w for w, cnt in emo_counts[emo].items() if cnt >= min_freq_per_emotion}
-                vocab_words = [w for w in w2v_model.wv.key_to_index if w in allow]
-            else:
-                vocab_words = list(w2v_model.wv.key_to_index.keys())
-
-            c = c / (np.linalg.norm(c) + 1e-12)
-            sims = {}
-            for w in vocab_words:
-                if not token_ok(w):
-                    continue
-                v = w2v_model.wv[w]
-                v = v / (np.linalg.norm(v) + 1e-12)
-                sims[w] = float(np.dot(v, c))
-
-            top_items = sorted(sims.items(), key=lambda kv: kv[1], reverse=True)[:cloud_words_cap]
-            if top_items:
-                m = min(val for _, val in top_items)
-                if m < 0:
-                    top_items = [(w, val - m) for w, val in top_items]
-            weights_per_emotion[emo] = dict(top_items)
-
-    # render clouds
+    # ---- Render per emotion + tables
     st.markdown("---")
     cols = st.columns(len(EMOTIONS))
+    combined_tables = []
     for col, emo in zip(cols, EMOTIONS):
         with col:
-            render_cloud(weights_per_emotion.get(emo, {}), f"{emo} — {method}", EMO2CMAP.get(emo, "viridis"))
+            title = f"{emo} — {method}"
+            freqs = weights_per_emotion.get(emo, {})
+            render_cloud(freqs, title, EMO2CMAP.get(emo, "viridis"))
+            top_df = top_table(freqs, top_n)
+            st.dataframe(top_df, use_container_width=True)
+            # add emotion column for combined export
+            if not top_df.empty:
+                tdf = top_df.copy()
+                tdf.insert(0, "Emotion", emo)
+                combined_tables.append(tdf)
 
-    #  quick interpretation
+    # Combined CSV download (all emotions)
+    if combined_tables:
+        all_df = pd.concat(combined_tables, ignore_index=True)
+        st.download_button(
+            "Download ALL emotions Top-N (CSV)",
+            data=all_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"wordcloud_tables_{method.lower().replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
+
     st.markdown("### Quick Interpretation")
     st.write(
-        "- **Positive:** praise words (e.g., *delicious, amazing, wonderful*).  \n"
-        "- **Negative:** complaint words (e.g., *awful, rancid, disappointing*).  \n"
-        "- **Neutral:** descriptive / transactional terms (e.g., *package, shipped, ingredients*)."
+        "- **Positive**: praise/adjectives (e.g., *delicious, amazing, wonderful*).  \n"
+        "- **Negative**: complaint/defect (e.g., *awful, rancid, disappointing*).  \n"
+        "- **Neutral**: transactional/description (*package, shipped, ingredients*)."
     )
-
-
-
-# FINAL PAGE: Predictions & Downloads (single + batch)
 
 def page_predictions():
     """
@@ -1714,9 +1559,9 @@ def page_predictions():
     EMOJI = {"Negative": "😞", "Neutral": "😐", "Positive": "😀"}
 
     IMAGE_PATHS = {
-        "Negative": r"C:\Users\Francesca Manu\PycharmProjects\Text_Group_Project\Negative.jpg",
-        "Neutral":  r"C:\Users\Francesca Manu\PycharmProjects\Text_Group_Project\Neutral.jpg",
-        "Positive": r"C:\Users\Francesca Manu\PycharmProjects\Text_Group_Project\Positive.jpg",  # fixed path
+        "Negative": r"Negative.jpg",
+        "Neutral":  r"Neutral.jpg",
+        "Positive": r"Positive.jpg",
     }
 
     # last trained accuracy (optional)
@@ -1848,27 +1693,33 @@ def page_predictions():
                 file_name=f"predictions_{model_choice.lower().replace(' ','_')}.csv",
                 mime="text/csv"
             )
-# ROUTER
 
+
+
+
+
+#  ROUTER
 PAGES = {
     "HomePage": page_home,
     "Data Load": page_data_load,
     "Preprocess & Labels": page_preprocess,
     "Post‑Cleaning Diagnostics": page_diagnostics,
     "Embeddings (Word2Vec)": page_word2vec,
-    "Modeling (RF & XGBoost)": page_modeling,
-    "Model Evaluation & Results":page_ModelEvaluation_and_Results,
+    "Modeling and Results (RF & XGBoost)": page_modeling_and_results,
     "Word Clouds": page_wordclouds,
     "Prediction Page":page_predictions,
 }
-#Sidebarlogo
-st.sidebar.image(
-        "C:/Users/Francesca Manu/PycharmProjects/Text_Group_Project/Homepage.png",
+
+# Sidebar logo (optional; wrap in try so it doesn't crash if missing)
+try:
+    st.sidebar.image(
+        "C:/Users/Francesca Manu/PycharmProjects/Text_Group_Project/Sidebar2.png",
         use_column_width=False,
-        width=200,
-)
+        width=300,
+    )
+except Exception:
+    pass
+
 # Sidebar navigation
 choice = st.sidebar.selectbox("Please Select Page", list(PAGES.keys()))
 PAGES[choice]()
-
-
